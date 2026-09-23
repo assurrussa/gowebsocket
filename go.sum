@@ -1,7 +1,7 @@
 github.com/assurrussa/gologger v0.1.0 h1:jo5VXaznPUReNXEruMrNOEfIbRLUctjfeRdElocU4F8=
 github.com/assurrussa/gologger v0.1.0/go.mod h1:/F/8c0qo2pd755T/YJ7A1hkCmbp/abM2747bsMta6ec=
-github.com/assurrussa/goshared v1.1.0 h1:MGAGax8D9JMdC2zRe53WXODR9tYl/SKZNb8fxDJm8k8=
-github.com/assurrussa/goshared v1.1.0/go.mod h1:R2wPHi5aVB1iYBxgc7UUCXu3NupnBjEzK/4U8aprows=
+github.com/assurrussa/goshared v1.4.0 h1:H6ScsoPAWJSYvzlX+Him+4BpsW/JRbTKW1SQNMKrrhs=
+github.com/assurrussa/goshared v1.4.0/go.mod h1:zmg2pYltOzdw7rQ0Z9ASTaSb7Cqzd8U97W7kX3sk3ws=
 github.com/fasthttp/websocket v1.5.12 h1:e4RGPpWW2HTbL3zV0Y/t7g0ub294LkiuXXUuTOUInlE=
 github.com/fasthttp/websocket v1.5.12/go.mod h1:I+liyL7/4moHojiOgUOIKEWm9EIxHqxZChS+aMFltyg=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=

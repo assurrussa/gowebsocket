@@ -6,7 +6,7 @@ toolchain go1.27.1
 
 require (
 	github.com/assurrussa/gologger v0.1.0
-	github.com/assurrussa/goshared v1.1.0
+	github.com/assurrussa/goshared v1.4.0
 	github.com/fasthttp/websocket v1.5.12
 	github.com/goccy/go-json v0.10.6
 	github.com/gofiber/fiber/v3 v3.5.0
