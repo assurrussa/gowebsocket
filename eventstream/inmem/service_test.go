@@ -2,13 +2,11 @@ package inmemeventstream_test
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/assurrussa/goshared/pkg/sharedtypes"
-	"github.com/assurrussa/goshared/pkg/tests"
-	"github.com/assurrussa/goshared/pkg/validator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/goleak"
@@ -29,26 +27,31 @@ type TestSuite struct {
 	stream eventstream.EventStream
 }
 
-func NewTestRepoSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
+func newTestRepoSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
 	t.Helper()
-	return tests.NewSuite[*TestSuite](t, func(t *testing.T, _ context.Context) *TestSuite {
-		t.Helper()
-		stream := inmemeventstream.New()
-		t.Cleanup(func() {
-			assert.NoError(t, stream.Close())
-		})
+	t.Parallel()
 
-		return &TestSuite{
-			stream: stream,
-		}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stream := inmemeventstream.New()
+	t.Cleanup(func() {
+		assert.NoError(t, stream.Close())
 	})
+
+	ts := &TestSuite{
+		stream: stream,
+	}
+	ts.SetT(t)
+
+	return ctx, cancel, ts
 }
 
 func TestSimpleSubscription(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
+	ctx, cancel, ts := newTestRepoSuite(t)
 	defer cancel()
-	uid := sharedtypes.NewUserID()
+	uid := eventstream.NewUserID()
 
 	events, err := ts.stream.Subscribe(ctx, uid)
 	ts.Require().NoError(err)
@@ -67,8 +70,8 @@ func TestSimpleSubscription(t *testing.T) {
 
 func TestSimpleSubscriptionNeedClose(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
-	uid := sharedtypes.NewUserID()
+	ctx, cancel, ts := newTestRepoSuite(t)
+	uid := eventstream.NewUserID()
 
 	events, err := ts.stream.Subscribe(ctx, uid)
 	ts.Require().NoError(err)
@@ -101,9 +104,9 @@ func TestSimpleSubscriptionNeedClose(t *testing.T) {
 
 func TestEventIsMultiplexedToStreams(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
+	ctx, cancel, ts := newTestRepoSuite(t)
 	defer cancel()
-	uid := sharedtypes.NewUserID()
+	uid := eventstream.NewUserID()
 
 	tab1, err := ts.stream.Subscribe(ctx, uid)
 	ts.Require().NoError(err)
@@ -156,9 +159,9 @@ func TestEventIsMultiplexedToStreams(t *testing.T) {
 
 func TestPublishInvalidEvent(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
+	ctx, cancel, ts := newTestRepoSuite(t)
 	defer cancel()
-	uid := sharedtypes.NewUserID()
+	uid := eventstream.NewUserID()
 
 	events, err := ts.stream.Subscribe(ctx, uid)
 	ts.Require().NoError(err)
@@ -176,15 +179,15 @@ func TestPublishInvalidEvent(t *testing.T) {
 
 func TestPublishWithoutSubscribers(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
+	ctx, cancel, ts := newTestRepoSuite(t)
 	defer cancel()
 	ts.Run("no subscriptions at all", func() {
-		err := ts.stream.Publish(ctx, sharedtypes.NewUserID(), newMessageEvent("Hello"))
+		err := ts.stream.Publish(ctx, eventstream.NewUserID(), newMessageEvent("Hello"))
 		ts.Require().NoError(err)
 	})
 
 	ts.Run("publish to offline client", func() {
-		uid1, uid2 := sharedtypes.NewUserID(), sharedtypes.NewUserID()
+		uid1, uid2 := eventstream.NewUserID(), eventstream.NewUserID()
 
 		// uid1 is online.
 		_, err := ts.stream.Subscribe(ctx, uid1)
@@ -197,7 +200,7 @@ func TestPublishWithoutSubscribers(t *testing.T) {
 
 	ts.Run("client was online and became offline", func() {
 		// Arrange.
-		uid := sharedtypes.NewUserID()
+		uid := eventstream.NewUserID()
 
 		subscribe := func(n int) (<-chan []string, context.CancelFunc) {
 			ctx, cancel := context.WithCancel(ctx)
@@ -245,17 +248,17 @@ func TestPublishWithoutSubscribers(t *testing.T) {
 
 func TestPublishInDifferentUserStreams(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestRepoSuite(t)
+	ctx, cancel, ts := newTestRepoSuite(t)
 	defer cancel()
 	// Arrange.
 	const users = 3
 	const messagesPerUser = 10
 
-	uids := make([]sharedtypes.UserID, 0, users)
+	uids := make([]eventstream.UserID, 0, users)
 	msgChannels := make([]<-chan []string, 0, users)
 
 	for i := 0; i < users; i++ {
-		uid := sharedtypes.NewUserID()
+		uid := eventstream.NewUserID()
 
 		events, err := ts.stream.Subscribe(ctx, uid)
 		ts.Require().NoError(err)
@@ -315,12 +318,12 @@ func readNewMessageEvents(stream <-chan eventstream.Event, n int) <-chan []strin
 }
 
 type testEvent struct {
-	ID          sharedtypes.EventID `validate:"required"`
+	ID          eventstream.EventID `validate:"required"`
 	MessageBody string              `validate:"required,max=3000"`
 	CreatedAt   time.Time           `validate:"required"`
 }
 
-func (t *testEvent) EventID() sharedtypes.EventID {
+func (t *testEvent) EventID() eventstream.EventID {
 	return t.ID
 }
 
@@ -329,12 +332,18 @@ func (t *testEvent) EventName() string {
 }
 
 func (t *testEvent) Validate() error {
-	return validator.Validator.Struct(t)
+	if t.ID.IsZero() {
+		return errors.New("id is required")
+	}
+	if t.MessageBody == "" {
+		return errors.New("message body is required")
+	}
+	return nil
 }
 
 func newMessageEvent(body string) eventstream.Event {
 	return &testEvent{
-		ID:          sharedtypes.NewEventID(),
+		ID:          eventstream.NewEventID(),
 		MessageBody: body,
 		CreatedAt:   time.Now(),
 	}

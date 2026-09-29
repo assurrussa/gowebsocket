@@ -8,9 +8,6 @@ import (
 	"time"
 
 	logger "github.com/assurrussa/gologger"
-	"github.com/assurrussa/goshared/pkg/sharedtypes"
-	"github.com/assurrussa/goshared/pkg/tests"
-	"github.com/assurrussa/goshared/pkg/validator"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -32,36 +29,41 @@ type TestSuite struct {
 	processor *eventprocessor2.Processor
 }
 
-func NewTestSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
+func newTestSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
 	t.Helper()
-	return tests.NewSuite[*TestSuite](t, func(t *testing.T, _ context.Context) *TestSuite {
-		t.Helper()
-		bf := bytes.NewBuffer(nil)
+	t.Parallel()
 
-		ctrl := gomock.NewController(t)
-		eventProcessorMock := eventprocessormocks.NewMockEventProcessor(ctrl)
-		eventProcessorMock2 := eventprocessormocks.NewMockEventProcessor(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
-		prs := map[string]eventprocessor2.EventProcessor{
-			testEventName1: eventProcessorMock,
-			testEventName2: eventProcessorMock2,
-		}
+	bf := bytes.NewBuffer(nil)
 
-		processorService, err := eventprocessor2.NewProcessor(eventprocessor2.NewOptions(
-			logger.DiscardJSONWithWriter(bf),
-			eventprocessor2.WithProcessors(prs),
-			eventprocessor2.WithMaxTimeWait(time.Millisecond*100),
-		))
-		require.NoError(t, err)
+	ctrl := gomock.NewController(t)
+	eventProcessorMock := eventprocessormocks.NewMockEventProcessor(ctrl)
+	eventProcessorMock2 := eventprocessormocks.NewMockEventProcessor(ctrl)
 
-		return &TestSuite{
-			bf:                  bf,
-			ctrl:                ctrl,
-			eventProcessorMock:  eventProcessorMock,
-			eventProcessorMock2: eventProcessorMock2,
-			processor:           processorService,
-		}
-	})
+	prs := map[string]eventprocessor2.EventProcessor{
+		testEventName1: eventProcessorMock,
+		testEventName2: eventProcessorMock2,
+	}
+
+	processorService, err := eventprocessor2.NewProcessor(eventprocessor2.NewOptions(
+		logger.DiscardJSONWithWriter(bf),
+		eventprocessor2.WithProcessors(prs),
+		eventprocessor2.WithMaxTimeWait(time.Millisecond*100),
+	))
+	require.NoError(t, err)
+
+	ts := &TestSuite{
+		bf:                  bf,
+		ctrl:                ctrl,
+		eventProcessorMock:  eventProcessorMock,
+		eventProcessorMock2: eventProcessorMock2,
+		processor:           processorService,
+	}
+	ts.SetT(t)
+
+	return ctx, cancel, ts
 }
 
 func Test_Init(t *testing.T) {
@@ -74,7 +76,7 @@ func Test_Init(t *testing.T) {
 
 func TestSimpleSubscription(t *testing.T) {
 	// Arrange.
-	ctx, cancel, ts := NewTestSuite(t)
+	ctx, cancel, ts := newTestSuite(t)
 	defer cancel()
 
 	ts.eventProcessorMock.EXPECT().Handle(gomock.Any(), gomock.Any()).
@@ -114,11 +116,11 @@ const (
 )
 
 type testEvent struct {
-	ID          sharedtypes.EventID `validate:"required"`
+	ID          eventstream.EventID `validate:"required"`
 	MessageBody string              `validate:"required,max=3000"`
 }
 
-func (t *testEvent) EventID() sharedtypes.EventID {
+func (t *testEvent) EventID() eventstream.EventID {
 	return t.ID
 }
 
@@ -127,22 +129,28 @@ func (t *testEvent) EventName() string {
 }
 
 func (t *testEvent) Validate() error {
-	return validator.Validator.Struct(t)
+	if t.ID.IsZero() {
+		return errors.New("id is required")
+	}
+	if t.MessageBody == "" {
+		return errors.New("message body is required")
+	}
+	return nil
 }
 
 func newTestEvent(body string) eventstream.Event {
 	return &testEvent{
-		ID:          sharedtypes.NewEventID(),
+		ID:          eventstream.NewEventID(),
 		MessageBody: body,
 	}
 }
 
 type testEvent2 struct {
-	ID          sharedtypes.EventID `validate:"required"`
+	ID          eventstream.EventID `validate:"required"`
 	MessageBody string              `validate:"required,max=3000"`
 }
 
-func (t *testEvent2) EventID() sharedtypes.EventID {
+func (t *testEvent2) EventID() eventstream.EventID {
 	return t.ID
 }
 
@@ -151,12 +159,18 @@ func (t *testEvent2) EventName() string {
 }
 
 func (t *testEvent2) Validate() error {
-	return validator.Validator.Struct(t)
+	if t.ID.IsZero() {
+		return errors.New("id is required")
+	}
+	if t.MessageBody == "" {
+		return errors.New("message body is required")
+	}
+	return nil
 }
 
 func newTestEvent2(body string) eventstream.Event {
 	return &testEvent2{
-		ID:          sharedtypes.NewEventID(),
+		ID:          eventstream.NewEventID(),
 		MessageBody: body,
 	}
 }
