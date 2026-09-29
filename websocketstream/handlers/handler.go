@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"time"
 
 	logger "github.com/assurrussa/gologger"
-	"github.com/assurrussa/goshared/pkg/sharedtypes"
 	libwebsocket "github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/utils/v2"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
 	eventstream "github.com/assurrussa/gowebsocket/eventstream"
@@ -29,7 +30,7 @@ const (
 var decoding = base64.StdEncoding
 
 type eventStream interface {
-	Subscribe(ctx context.Context, userID sharedtypes.UserID) (<-chan eventstream.Event, error)
+	Subscribe(ctx context.Context, userID eventstream.UserID) (<-chan eventstream.Event, error)
 }
 
 //go:generate options-gen -out-filename=handler_options.gen.go -from-struct=Options
@@ -288,28 +289,140 @@ func (h *HTTPHandler) writeLoop(ctx context.Context, ws websocketstream.Websocke
 
 // getUserID retrieves the user ID from the fiber context.
 
-// userWithUUID defines an interface for any struct that has a GetUUID method.
-// This allows us to safely get the user ID from the session struct without import cycles.
-type userWithUUID interface {
-	GetUUID() sharedtypes.UserID
+// userWithEventstreamUUID defines an interface for structs returning eventstream.UserID.
+type userWithEventstreamUUID interface {
+	GetUUID() eventstream.UserID
 }
 
-func (h *HTTPHandler) getUserID(ctx *Conn) (sharedtypes.UserID, bool) {
+// userWithUUIDUUID defines an interface for structs returning uuid.UUID.
+type userWithUUIDUUID interface {
+	GetUUID() uuid.UUID
+}
+
+// userWithStringUUID defines an interface for structs returning string.
+type userWithStringUUID interface {
+	GetUUID() string
+}
+
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+func toUserID(v any) (eventstream.UserID, bool) {
+	if isNil(v) {
+		return eventstream.UserIDNil, false
+	}
+
+	switch id := v.(type) {
+	case eventstream.UserID:
+		return id, !id.IsZero()
+	case uuid.UUID:
+		u := eventstream.UserID(id)
+		return u, !u.IsZero()
+	case [16]byte:
+		u := eventstream.UserID(id)
+		return u, !u.IsZero()
+	case string:
+		u, err := eventstream.ParseUserID(id)
+		if err != nil {
+			return eventstream.UserIDNil, false
+		}
+		return u, !u.IsZero()
+	case fmt.Stringer:
+		u, err := eventstream.ParseUserID(id.String())
+		if err != nil {
+			return eventstream.UserIDNil, false
+		}
+		return u, !u.IsZero()
+	default:
+		return eventstream.UserIDNil, false
+	}
+}
+
+func (h *HTTPHandler) getUserID(ctx *Conn) (eventstream.UserID, bool) {
 	val := ctx.Locals(h.userIDCtxKey)
-	if val == nil {
-		return sharedtypes.UserIDNil, false
+	if isNil(val) {
+		return eventstream.UserIDNil, false
 	}
 
-	if userID, ok := val.(sharedtypes.UserID); ok {
-		return userID, !userID.IsZero()
+	switch id := val.(type) {
+	case eventstream.UserID:
+		return id, !id.IsZero()
+	case uuid.UUID:
+		u := eventstream.UserID(id)
+		return u, !u.IsZero()
+	case [16]byte:
+		u := eventstream.UserID(id)
+		return u, !u.IsZero()
 	}
 
-	if user, ok := val.(userWithUUID); ok && user != nil {
-		userID := user.GetUUID()
-		return userID, !userID.IsZero()
+	if user, ok := val.(userWithEventstreamUUID); ok {
+		u := user.GetUUID()
+		return u, !u.IsZero()
 	}
 
-	return sharedtypes.UserIDNil, false
+	if user, ok := val.(userWithUUIDUUID); ok {
+		u := eventstream.UserID(user.GetUUID())
+		return u, !u.IsZero()
+	}
+
+	if user, ok := val.(userWithStringUUID); ok {
+		u, err := eventstream.ParseUserID(user.GetUUID())
+		if err != nil || u.IsZero() {
+			return eventstream.UserIDNil, false
+		}
+		return u, true
+	}
+
+	if u, ok, hasMethod := getUserIDByReflection(val); hasMethod {
+		return u, ok
+	}
+
+	return toUserID(val)
+}
+
+func getUserIDByReflection(val any) (id eventstream.UserID, ok bool, hasMethod bool) {
+	if isNil(val) {
+		return eventstream.UserIDNil, false, false
+	}
+
+	rv := reflect.ValueOf(val)
+	if !rv.IsValid() {
+		return eventstream.UserIDNil, false, false
+	}
+
+	method := rv.MethodByName("GetUUID")
+	if !method.IsValid() && rv.Kind() == reflect.Struct {
+		ptr := reflect.New(rv.Type())
+		ptr.Elem().Set(rv)
+		method = ptr.MethodByName("GetUUID")
+	}
+
+	if !method.IsValid() {
+		return eventstream.UserIDNil, false, false
+	}
+
+	if method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
+		return eventstream.UserIDNil, false, true
+	}
+
+	res := method.Call(nil)
+	if len(res) != 1 {
+		return eventstream.UserIDNil, false, true
+	}
+
+	u, ok := toUserID(res[0].Interface())
+	return u, ok, true
 }
 
 func pongWait(ping time.Duration) time.Duration {

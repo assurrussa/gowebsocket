@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	logger "github.com/assurrussa/gologger"
-	sharedtypes "github.com/assurrussa/goshared/pkg/sharedtypes"
 	"github.com/imkira/go-observer"
 
 	eventstream "github.com/assurrussa/gowebsocket/eventstream"
@@ -32,8 +31,8 @@ const serviceName = "event-stream"
 type Service struct {
 	wg        sync.WaitGroup
 	mu        sync.RWMutex
-	subs      map[sharedtypes.UserID]observer.Property
-	subsCount map[sharedtypes.UserID]int
+	subs      map[eventstream.UserID]observer.Property
+	subsCount map[eventstream.UserID]int
 	logger    logger.Logger
 }
 
@@ -41,13 +40,13 @@ func New() *Service {
 	return &Service{
 		wg:        sync.WaitGroup{},
 		mu:        sync.RWMutex{},
-		subs:      map[sharedtypes.UserID]observer.Property{},
-		subsCount: map[sharedtypes.UserID]int{},
+		subs:      map[eventstream.UserID]observer.Property{},
+		subsCount: map[eventstream.UserID]int{},
 		logger:    logger.Default().WithNamed(serviceName),
 	}
 }
 
-func (s *Service) Subscribe(ctx context.Context, userID sharedtypes.UserID) (<-chan eventstream.Event, error) {
+func (s *Service) Subscribe(ctx context.Context, userID eventstream.UserID) (<-chan eventstream.Event, error) {
 	s.mu.Lock()
 	p, ok := s.subs[userID]
 	if !ok {
@@ -99,7 +98,7 @@ func (s *Service) Subscribe(ctx context.Context, userID sharedtypes.UserID) (<-c
 	return events, nil
 }
 
-func (s *Service) Publish(ctx context.Context, userID sharedtypes.UserID, event eventstream.Event) error {
+func (s *Service) Publish(ctx context.Context, userID eventstream.UserID, event eventstream.Event) error {
 	if userID.IsZero() {
 		return nil
 	}
@@ -127,7 +126,7 @@ func (s *Service) Close() error {
 	return nil
 }
 
-func (s *Service) getSubsCount(uid sharedtypes.UserID) int {
+func (s *Service) getSubsCount(uid eventstream.UserID) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

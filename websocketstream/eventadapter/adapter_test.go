@@ -4,8 +4,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/assurrussa/goshared/pkg/sharedtypes"
-	"github.com/assurrussa/goshared/pkg/validator"
 	"github.com/goccy/go-json"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +31,7 @@ func TestAdapter_Init(t *testing.T) {
 }
 
 func TestAdapter_Adapt(t *testing.T) {
-	eventID := sharedtypes.MustParse[sharedtypes.EventID](defaultEventIDText)
+	eventID := eventstream.MustParse[eventstream.EventID](defaultEventIDText)
 	defaultEventMessage := newMessageEvent(eventID, helloWorldBody)
 	defaultEventAdaptMessage := newMessageEventAdapt(eventID, helloWorldBody)
 	processors := map[string]eventadapter2.EventAdapter{
@@ -101,7 +99,7 @@ func TestAdapter_Adapt(t *testing.T) {
 }
 
 func TestAdapter_AdaptInverse(t *testing.T) {
-	eventID := sharedtypes.MustParse[sharedtypes.EventID](defaultEventIDText)
+	eventID := eventstream.MustParse[eventstream.EventID](defaultEventIDText)
 	defaultEventMessage := newMessageEvent(eventID, helloWorldBody)
 	defaultEventAdaptMessage := newMessageEventAdapt(eventID, helloWorldBody)
 	processors := map[string]eventadapter2.EventAdapter{
@@ -174,12 +172,12 @@ func TestAdapter_AdaptInverse(t *testing.T) {
 }
 
 type testEvent struct {
-	ID          sharedtypes.EventID `json:"eventId" validate:"required"`
+	ID          eventstream.EventID `json:"eventId" validate:"required"`
 	EventType   string              `json:"eventType" validate:"required"`
 	MessageBody string              `json:"body" validate:"required,max=3000"`
 }
 
-func (t *testEvent) EventID() sharedtypes.EventID {
+func (t *testEvent) EventID() eventstream.EventID {
 	return t.ID
 }
 
@@ -188,10 +186,19 @@ func (t *testEvent) EventName() string {
 }
 
 func (t *testEvent) Validate() error {
-	return validator.Validator.Struct(t)
+	if t.ID.IsZero() {
+		return errors.New("id is required")
+	}
+	if t.EventType == "" {
+		return errors.New("eventType is required")
+	}
+	if t.MessageBody == "" {
+		return errors.New("message body is required")
+	}
+	return nil
 }
 
-func newMessageEvent(id sharedtypes.EventID, body string) eventstream.Event {
+func newMessageEvent(id eventstream.EventID, body string) eventstream.Event {
 	return &testEvent{
 		ID:          id,
 		EventType:   defaultEventType,
@@ -200,12 +207,12 @@ func newMessageEvent(id sharedtypes.EventID, body string) eventstream.Event {
 }
 
 type testEventAdapt struct {
-	ID          sharedtypes.EventID `json:"eventId" validate:"required"`
+	ID          eventstream.EventID `json:"eventId" validate:"required"`
 	EventType   string              `json:"eventType" validate:"required"`
 	MessageBody string              `json:"body" validate:"required,max=3000"`
 }
 
-func (t *testEventAdapt) EventID() sharedtypes.EventID {
+func (t *testEventAdapt) EventID() eventstream.EventID {
 	return t.ID
 }
 
@@ -214,10 +221,19 @@ func (t *testEventAdapt) EventName() string {
 }
 
 func (t *testEventAdapt) Validate() error {
-	return validator.Validator.Struct(t)
+	if t.ID.IsZero() {
+		return errors.New("id is required")
+	}
+	if t.EventType == "" {
+		return errors.New("eventType is required")
+	}
+	if t.MessageBody == "" {
+		return errors.New("message body is required")
+	}
+	return nil
 }
 
-func newMessageEventAdapt(id sharedtypes.EventID, body string) eventstream.Event {
+func newMessageEventAdapt(id eventstream.EventID, body string) eventstream.Event {
 	return &testEventAdapt{
 		ID:          id,
 		EventType:   adaptedEventType,
