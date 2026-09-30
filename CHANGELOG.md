@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — review hardening
+## v0.2.0 (2026-09-30)
 
 Bounded messages, decoded payloads, outbound writes, subscriber mailboxes and
 worker queues. Fixed shutdown admission races, stale subscriber registries and
