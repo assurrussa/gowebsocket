@@ -14,5 +14,5 @@ matching and preserved handshake status codes. Removed Conn pooling and retained
 Fiber request metadata; added resource Stats and defined ownership of processors.
 
 Added deterministic regression/integration tests, fuzz targets, benchmarks,
-runnable example, CI, consumer smoke checks and release documentation. See
+runnable example, consumer smoke checks and release documentation. See
 [the migration guide](docs/MIGRATION.md) for intentional behavioral changes.

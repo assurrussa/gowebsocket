@@ -16,5 +16,5 @@ payload and subscriber counts before making performance claims.
 
 The transport is process-local and best-effort. Do not add distributed brokers,
 replay or persistence without an explicit design and consumer requirement.
-Do not weaken validation, suppress failed CI or call a timed-out shutdown
-successful. An empty or unstarted CI run is not a passing release gate.
+Do not weaken validation, suppress failed checks or call a timed-out shutdown
+successful. An empty or unstarted check run is not a passing release gate.

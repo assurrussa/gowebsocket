@@ -28,7 +28,12 @@ import (
 	"github.com/assurrussa/gowebsocket/websocketstream/handlers"
 )
 
-func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreAnyFunction("github.com/valyala/fasthttp.(*workerPool).Start.func2"),
+		goleak.IgnoreAnyFunction("github.com/valyala/fasthttp.updateServerDate.func1"),
+	)
+}
 
 type checkedEvent struct {
 	trusted, claimed eventstream.UserID

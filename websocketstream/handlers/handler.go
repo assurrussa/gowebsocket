@@ -315,8 +315,6 @@ func (h *HTTPHandler) writeLoop(ctx context.Context, ws websocketstream.Websocke
 			})
 			if err != nil {
 				// Do not flush a partial application message as valid JSON.
-				_ = ws.Close()
-				_ = writer.Close()
 				return err
 			}
 			if err := writer.Close(); err != nil {

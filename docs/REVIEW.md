@@ -57,7 +57,7 @@ duration and close counters without imposing a metrics backend.
 ## Packaging: R23–R27
 
 R23: working localhost server/browser example uses the actual constructors and
-an explicit JSON endpoint. The example is compiled by CI and has no real auth.
+an explicit JSON endpoint. The example has no real auth.
 
 R24: check is non-mutating; fix/tidy/generate are separate. Mockgen and lint
 versions are pinned; the private toolsmocks command and options-gen runtime are
@@ -69,7 +69,7 @@ microbenchmarks. Historical UUID/adapter/transport tests remain except the strea
 and processor suites replaced with deterministic tests for the new contracts.
 
 R26: proposed MIT license, SECURITY, CONTRIBUTING, migration/changelog,
-least-privilege pinned-action CI and a clean consumer smoke test. Repository
+clean consumer smoke test. Repository
 visibility, release tags and protections are unchanged.
 
 R27: standard JSON in production, a small slog-compatible logger interface and
@@ -79,6 +79,4 @@ tests use them. Broker, durability, rooms and presence are deliberately not adde
 ## Verification limitations
 
 Full Go 1.27.1/Fiber integration and lint need the matching toolchain and network
-access. The authoring environment's Go 1.23.2 can run the byte-identical stdlib
-core packages in a separate temporary module; it cannot validate the complete
-module graph. CI results and the PR's current SHA remain the release authority.
+access. Local verification and the PR's current SHA remain the release authority.
