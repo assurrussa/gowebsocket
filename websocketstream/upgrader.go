@@ -14,8 +14,8 @@ import (
 	"github.com/assurrussa/gowebsocket/internal/origin"
 )
 
-// Websocket deliberately keeps the legacy interface. HTTPHandler discovers
-// SetReadLimit through an optional interface and always uses a bounded reader.
+// Websocket deliberately keeps the legacy interface. HTTPHandler can tighten
+// known transport limits through optional interfaces and always bounds reads.
 type Websocket interface {
 	SetWriteDeadline(t time.Time) error
 	NextWriter(messageType int) (io.WriteCloser, error)
@@ -39,8 +39,10 @@ type Config struct {
 	// independently contains panics in its pumps and application workers.
 	RecoverHandler     func(*libwebsocket.Conn)
 	AllowMissingOrigin bool
-	HandshakeTimeout   time.Duration
-	ReadLimit          int64
+	// HandshakeTimeout bounds net/http upgrades. The pinned FastHTTP upgrader
+	// does not apply it; configure the host server's HTTP write timeout as well.
+	HandshakeTimeout time.Duration
+	ReadLimit        int64
 }
 
 type upgraderImpl struct {
@@ -109,6 +111,10 @@ func NewUpgraderChecked(allowed, protocols []string, cfg Config) (Upgrader, erro
 }
 
 func defaultRecover(conn *libwebsocket.Conn) {
+	//nolint:revive // Called directly by defer so recover sees the callback panic.
+	if recover() == nil {
+		return
+	}
 	// Do not write a JSON data frame concurrently with the data writer, and do
 	// not return panic values (which may contain secrets) to the client.
 	slog.Error("websocket callback panicked")
@@ -116,6 +122,9 @@ func defaultRecover(conn *libwebsocket.Conn) {
 		libwebsocket.FormatCloseMessage(libwebsocket.CloseInternalServerErr, ""), time.Now().Add(time.Second))
 	_ = conn.Close()
 }
+
+// ReadLimit exposes the configured transport bound without extending Upgrader.
+func (u *upgraderImpl) ReadLimit() int64 { return u.readLimit }
 
 func (u *upgraderImpl) Upgrade(w http.ResponseWriter, r *http.Request, headers http.Header) (Websocket, error) {
 	if u.initErr != nil {
@@ -137,16 +146,10 @@ func (u *upgraderImpl) UpgradeFastHTTP(ctx *fasthttp.RequestCtx, handler libwebs
 	}
 	return u.upgraderFastHTTP.Upgrade(ctx, func(conn *libwebsocket.Conn) {
 		defer conn.Close()
-		defer func() {
-			if recover() != nil {
-				defaultRecover(conn)
-			}
-		}()
-		defer func() {
-			if recover() != nil {
-				u.recoverHandlerFastHTTP(conn)
-			}
-		}()
+		defer defaultRecover(conn)
+		// Defer the callback directly so its recover() sees the original panic.
+		// The outer recovery also contains panics in the recovery callback itself.
+		defer u.recoverHandlerFastHTTP(conn)
 		conn.SetReadLimit(u.readLimit)
 		handler(conn)
 	})

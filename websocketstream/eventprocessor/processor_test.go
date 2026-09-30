@@ -200,3 +200,16 @@ func TestAdmissionPausedAcrossClose(t *testing.T) {
 		t.Fatal("handler ran after completed Close")
 	}
 }
+
+func TestClosedProcessorRejectsBeforeSnapshot(t *testing.T) {
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	for _, event := range []eventstream.Event{nil, testevent.New("unknown registration")} {
+		if err := p.Submit(context.Background(), event); !errors.Is(err, eventprocessor.ErrClosed) {
+			t.Fatalf("closed processor still validated or routed an event: %v", err)
+		}
+	}
+}

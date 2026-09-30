@@ -80,6 +80,12 @@ again after decompression, so a small compressed message cannot bypass the
 application payload limit. Configure limits using `WithMessageLimits`,
 `WithMaxOutboundBytes` and `WithMaxConnections`.
 
+HTTPHandler tightens the built-in upgrader's `Config.ReadLimit` and never raises
+it. To accept larger frames, increase both the upgrader and handler limits.
+Custom upgraders can expose `ReadLimit() int64` for the same composition. Without
+that optional provider, the handler preserves the existing transport limit and
+enforces its own message and decoded-payload limits through bounded reading.
+
 The in-memory stream defaults to 64 queued events / 1 MiB of encoded payload per
 subscription, a 64 KiB event limit, 10,000 subscribers globally and 16 per user.
 Use `inmem.NewWithConfig(inmem.DefaultConfig())` with adjusted values.
@@ -91,8 +97,10 @@ application's ordinary API.
 
 Payloads are snapshotted as immutable JSON. Do not mutate an event concurrently
 with Publish/Submit; after either returns, its queued snapshot is independent.
-Each subscriber gets its own decoded event. Unexported/JSON-ignored state must
-not be required for event validity. Non-JSON events need an application adapter.
+Each subscriber gets its own decoded event. EventID and EventName must remain
+stable through the JSON round trip; a snapshot that changes either is rejected.
+Unexported/JSON-ignored state must not be required for event validity. Non-JSON
+events need an application adapter.
 Byte accounting measures serialized queued payload, **not total heap/RSS**.
 There can also be one decoded event in flight per subscriber, active worker
 payloads, contexts and transport buffers. Custom JSON methods must be bounded,
@@ -116,8 +124,8 @@ boundaries without exposing panic values or message bodies to clients/logs.
 
 Call `handler.Shutdown(ctx)` before shutting down the HTTP application, then
 close the event stream and any **injected** processor you own. A closed shutdown
-channel is a compatibility trigger for handler shutdown. A nil channel means
-explicit shutdown only.
+channel is a compatibility trigger for handler shutdown, including before the
+first request. A nil channel means explicit shutdown only.
 
 HTTPHandler owns its default processor and drains it automatically. It never
 closes an injected processor, stream or logger. `Service.Shutdown` cancels all
@@ -141,6 +149,11 @@ endpoints. Host globs are compiled once. `Config.AllowMissingOrigin` explicitly
 supports non-browser clients; Origin itself is not authentication.
 `NewUpgraderChecked` reports invalid configuration at startup. HTTP upgrade
 errors retain their original status instead of becoming 426.
+
+Configure HTTP read/write deadlines in the host Fiber/FastHTTP server as well.
+FastHTTP's upgrader in the pinned version does not apply HandshakeTimeout to
+the HTTP response write; the handler's handoff timeout releases its admission
+slot but cannot interrupt a response still owned by the HTTP server.
 
 `Stats()` snapshots are exposed by handler, stream and processor: active
 connections/subscribers, queued payload, evictions, admission/processing counts,

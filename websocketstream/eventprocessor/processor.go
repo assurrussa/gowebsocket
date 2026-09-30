@@ -116,6 +116,9 @@ func (p *Processor) Submit(ctx context.Context, event eventstream.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if p.pool.Closed() {
+		return ErrClosed
+	}
 	snapshot, err := eventsnapshot.New(event, p.maxEventBytes)
 	if err != nil {
 		return err

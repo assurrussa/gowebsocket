@@ -257,6 +257,22 @@ func TestConcurrentSubscribeShutdown(t *testing.T) {
 	}
 }
 
+type rejectedEvent struct{ *testevent.Event }
+
+func (rejectedEvent) Validate() error { panic("closed stream must not invoke event callbacks") }
+
+func TestClosedStreamRejectsBeforeSnapshot(t *testing.T) {
+	s := service(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []eventstream.Event{nil, rejectedEvent{testevent.New("body")}} {
+		if err := s.Publish(context.Background(), eventstream.NewUserID(), event); !errors.Is(err, inmem.ErrClosed) {
+			t.Fatalf("closed stream invoked validation or serialization: %v", err)
+		}
+	}
+}
+
 func BenchmarkPublishAndReceive(b *testing.B) {
 	s := inmem.New()
 	defer s.Close()

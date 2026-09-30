@@ -6,7 +6,7 @@ and regression coverage, not an assertion that every CI gate has passed.
 ## Runtime safety: R01–R11
 
 R01: `internal/wire` limits both decompressed messages and decoded payloads;
-HTTPHandler also sets the transport read limit. Covered by wire limits and the
+HTTPHandler also tightens known transport read limits. Covered by wire limits and the
 real WebSocket compressed-message test.
 
 R02: shared ValidateEvent, typed-nil protection, generic Go-type checks and
@@ -80,3 +80,38 @@ tests use them. Broker, durability, rooms and presence are deliberately not adde
 
 Full Go 1.27.1/Fiber integration and lint need the matching toolchain and network
 access. Local verification and the PR's current SHA remain the release authority.
+
+## Follow-up branch review
+
+Review baseline: `fix/review-hardening` at `f443347`, compared with `b55c50e`.
+The follow-up fixes preserve public signatures and the existing wire modes:
+
+- Shutdown-channel monitoring starts at construction. An already closed channel
+  rejects the first request, and admission rechecks the signal after identity
+  extraction. Tests cover shutdown without requests and pending handoff expiry.
+- RecoverHandler is deferred directly, preserving its ability to call recover
+  on the original callback panic. Tests cover ordinary return, custom recovery
+  and fallback recovery for handlers that panic or do not recover.
+- Handler and built-in upgrader read limits compose using the smaller positive
+  bound. Unknown custom-upgrader limits are preserved, while bounded payload
+  decoding remains mandatory. This addresses PR #2's stricter-limit requirement.
+- JSON snapshots check EventID as well as EventName. A disappearing identifier
+  is rejected before publication or worker admission; zero IDs are not newly
+  prohibited when the application contract permits them.
+- Closed Publish/Submit calls reject before event validation or serialization.
+  Admission still rechecks closure after snapshot construction, preserving the
+  existing concurrent-close guarantee.
+- Subscription errors, nil channels and panics send close 1011 and increment the
+  internal-close counter. Real WebSocket tests also cover malformed/unknown input,
+  binary frames, processor overload (1013) and outbound size rejection (1009).
+
+HTTP response deadlines remain a host responsibility: FastHTTP's pinned
+upgrader does not implement its HandshakeTimeout field. Handoff expiration bounds
+handler admission state rather than terminating an HTTP-server response write.
+
+Validation on Go 1.27.1 (darwin/arm64): `make check` passed with temporary Go/lint
+caches. This ran format checks, `go vet ./...`, golangci-lint v2.14.0 (zero issues),
+`go test -timeout=3m ./...`, `go test -race -count=5 -timeout=5m ./...`, example
+builds and `scripts/test-consumer.sh`. The consumer probe uses a local replacement
+of this checkout; it does not verify a published release. Go 1.27.0, production
+load and deployment were not verified in this follow-up.

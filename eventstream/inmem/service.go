@@ -138,6 +138,12 @@ func (s *Service) Publish(ctx context.Context, userID eventstream.UserID, event 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
 	if err := userID.Validate(); err != nil {
 		return err
 	}

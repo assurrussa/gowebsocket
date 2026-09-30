@@ -21,6 +21,7 @@ type Snapshot struct {
 	data []byte
 	typ  reflect.Type
 	name string
+	id   eventstream.EventID
 }
 
 func New(event eventstream.Event, maxBytes int) (snapshot Snapshot, err error) {
@@ -38,7 +39,7 @@ func New(event eventstream.Event, maxBytes int) (snapshot Snapshot, err error) {
 		if len(data) > maxBytes {
 			return ErrTooLarge
 		}
-		snapshot = Snapshot{data: data, typ: reflect.TypeOf(event), name: strings.Clone(event.EventName())}
+		snapshot = Snapshot{data: data, typ: reflect.TypeOf(event), name: strings.Clone(event.EventName()), id: event.EventID()}
 		// Reject events whose required fields disappear during the round trip.
 		_, err = snapshot.Event()
 		return err
@@ -79,6 +80,9 @@ func (s Snapshot) Event() (event eventstream.Event, err error) {
 		}
 		if event.EventName() != s.name {
 			return errors.New("event name changed during JSON round trip")
+		}
+		if event.EventID() != s.id {
+			return fmt.Errorf("event ID changed during JSON round trip: %w", eventstream.ErrInvalidEvent)
 		}
 		return nil
 	})

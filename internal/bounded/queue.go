@@ -123,3 +123,10 @@ func (q *Queue[T]) Stats() (messages, bytes int) {
 	defer q.mu.Unlock()
 	return q.count, q.bytes
 }
+
+// Closed reports whether admission has been sealed or aborted.
+func (q *Queue[T]) Closed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.sealed
+}

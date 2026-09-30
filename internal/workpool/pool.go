@@ -132,6 +132,8 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 
 func (p *Pool) Close() { _ = p.Shutdown(context.Background()) }
 
+func (p *Pool) Closed() bool { return p.queue.Closed() }
+
 func (p *Pool) Stats() Stats {
 	n, b := p.queue.Stats()
 	return Stats{

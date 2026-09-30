@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -12,10 +13,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	libwebsocket "github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v3"
+	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttputil"
 	"go.uber.org/goleak"
 
@@ -60,11 +63,15 @@ func (p checkedProcessor) Handle(ctx context.Context, event eventstream.Event) e
 
 type readyStream struct {
 	*inmem.Service
-	ready chan struct{}
-	once  sync.Once
+	ready     chan struct{}
+	once      sync.Once
+	subscribe func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error)
 }
 
 func (s *readyStream) Subscribe(ctx context.Context, id eventstream.UserID) (<-chan eventstream.Event, error) {
+	if s.subscribe != nil {
+		return s.subscribe(ctx, id)
+	}
 	events, err := s.Service.Subscribe(ctx, id)
 	if err == nil {
 		s.once.Do(func() { close(s.ready) })
@@ -87,6 +94,19 @@ type testServer struct {
 
 func newHardeningServer(t *testing.T, options ...handlers.OptOptionsSetter) *testServer {
 	t.Helper()
+	return newHardeningServerWithShutdown(t, nil, options...)
+}
+
+func newHardeningServerWithShutdown(t *testing.T, shutdown <-chan struct{}, options ...handlers.OptOptionsSetter) *testServer {
+	t.Helper()
+	upgrader := websocketstream.NewUpgrader([]string{testOrigin}, nil, websocketstream.Config{EnableCompression: true})
+	return newHardeningServerWithUpgrader(t, shutdown, upgrader, options...)
+}
+
+func newHardeningServerWithUpgrader(
+	t *testing.T, shutdown <-chan struct{}, upgrader websocketstream.Upgrader, options ...handlers.OptOptionsSetter,
+) *testServer {
+	t.Helper()
 	s := &testServer{
 		uid:       eventstream.NewUserID(),
 		processed: make(chan checkedEvent, 16),
@@ -99,9 +119,8 @@ func newHardeningServer(t *testing.T, options ...handlers.OptOptionsSetter) *tes
 		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{"test": checkedProcessor{output: s.processed}}),
 	)
 	defaults = append(defaults, options...)
-	upgrader := websocketstream.NewUpgrader([]string{testOrigin}, nil, websocketstream.Config{EnableCompression: true})
 	var err error
-	s.h, err = handlers.NewHTTPHandler(handlers.NewOptions(log, s.bus, upgrader, nil, "uid", defaults...))
+	s.h, err = handlers.NewHTTPHandler(handlers.NewOptions(log, s.bus, upgrader, shutdown, "uid", defaults...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +245,92 @@ func TestCompressedMessageLimit(t *testing.T) {
 	}
 }
 
+// Embedding the legacy interface hides optional transport limit information.
+type unknownReadLimitUpgrader struct{ websocketstream.Upgrader }
+
+func expectMessageTooBig(t *testing.T, conn *libwebsocket.Conn) {
+	t.Helper()
+	_, _, err := conn.ReadMessage()
+	if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) {
+		t.Fatalf("expected oversized close: %v", err)
+	}
+}
+
+func TestTransportReadLimitPreserved(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		for _, format := range []handlers.WireFormat{handlers.JSON, handlers.LegacyBase64} {
+			name := fmt.Sprintf("unknown=%t/format=%s", unknown, format)
+			t.Run(name, func(t *testing.T) {
+				upgrader, err := websocketstream.NewUpgraderChecked([]string{testOrigin}, nil, websocketstream.Config{
+					ReadLimit: 1024, EnableCompression: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if unknown {
+					upgrader = unknownReadLimitUpgrader{upgrader}
+				}
+				s := newHardeningServerWithUpgrader(t, nil, upgrader, handlers.WithWireFormat(format))
+				conn := s.dial(t)
+				conn.EnableWriteCompression(false)
+				payload, err := json.Marshal(testevent.New(strings.Repeat("x", 2048)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if format == handlers.LegacyBase64 {
+					payload = []byte(base64.StdEncoding.EncodeToString(payload))
+				}
+				if err := conn.WriteMessage(libwebsocket.TextMessage, payload); err != nil {
+					t.Fatal(err)
+				}
+				expectMessageTooBig(t, conn)
+				select {
+				case <-s.processed:
+					t.Fatal("transport oversized event reached handler")
+				default:
+				}
+			})
+		}
+	}
+}
+
+func TestHandlerReadLimitRemainsEffective(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unknown=%t", unknown), func(t *testing.T) {
+			upgrader := websocketstream.NewUpgrader([]string{testOrigin}, nil, websocketstream.Config{ReadLimit: 4096})
+			if unknown {
+				upgrader = unknownReadLimitUpgrader{upgrader}
+			}
+			s := newHardeningServerWithUpgrader(t, nil, upgrader,
+				handlers.WithWireFormat(handlers.JSON), handlers.WithMessageLimits(1024, 1024),
+			)
+			conn := s.dial(t)
+			if err := conn.WriteJSON(testevent.New(strings.Repeat("x", 2048))); err != nil {
+				t.Fatal(err)
+			}
+			expectMessageTooBig(t, conn)
+		})
+	}
+}
+
+func TestTransportReadLimitCountsCompressedPayload(t *testing.T) {
+	upgrader := websocketstream.NewUpgrader([]string{testOrigin}, nil, websocketstream.Config{
+		ReadLimit: 1024, EnableCompression: true,
+	})
+	s := newHardeningServerWithUpgrader(t, nil, upgrader, handlers.WithWireFormat(handlers.JSON))
+	conn := s.dial(t)
+	conn.EnableWriteCompression(true)
+	// The encoded frame is under 1 KiB, while the decoded message is above it.
+	if err := conn.WriteJSON(testevent.New(strings.Repeat("x", 2048))); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.processed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("compressed event within transport and handler limits was not processed")
+	}
+}
+
 func TestIdentityRejectedBeforeUpgrade(t *testing.T) {
 	s := newHardeningServer(t, handlers.WithUserIDExtractor(func(fiber.Ctx) (eventstream.UserID, error) {
 		return eventstream.UserIDNil, errors.New("invalid session")
@@ -326,4 +431,197 @@ func TestZeroPingRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("zero ping accepted")
 	}
+}
+
+func TestShutdownChannelWithoutRequests(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := inmem.New()
+		defer bus.Close()
+		shutdown := make(chan struct{})
+		h, err := handlers.NewHTTPHandler(handlers.NewOptions(slog.Default(), bus,
+			websocketstream.NewUpgrader([]string{testOrigin}, nil), shutdown, "uid"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		close(shutdown)
+		synctest.Wait()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := h.Shutdown(ctx); err != nil {
+			t.Fatalf("shutdown channel did not finish the unused handler: %v", err)
+		}
+	})
+}
+
+func TestClosedShutdownChannelRejectsFirstRequest(t *testing.T) {
+	shutdown := make(chan struct{})
+	close(shutdown)
+	s := newHardeningServerWithShutdown(t, shutdown)
+	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("closed handler admitted its first request: %v %v", response, err)
+	}
+	if stats := s.h.Stats(); stats.Accepted != 0 || stats.Active != 0 || s.bus.Stats().Subscribers != 0 {
+		t.Fatal("shutdown admitted work", stats)
+	}
+}
+
+func TestMalformedAndUnsupportedMessages(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    int
+		payload []byte
+		code    int
+	}{
+		{name: "binary", kind: libwebsocket.BinaryMessage, payload: []byte(`{}`), code: libwebsocket.CloseUnsupportedData},
+		{name: "JSON", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":`), code: libwebsocket.ClosePolicyViolation},
+		{name: "UTF8", kind: libwebsocket.TextMessage, payload: []byte{255}, code: libwebsocket.ClosePolicyViolation},
+		{
+			name: "unknown", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":"unknown"}`),
+			code: libwebsocket.ClosePolicyViolation,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON))
+			conn := s.dial(t)
+			if err := conn.WriteMessage(tc.kind, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := conn.ReadMessage()
+			if !libwebsocket.IsCloseError(err, tc.code) {
+				t.Fatalf("unexpected close code: %v", err)
+			}
+			if s.h.Stats().Incoming != 0 {
+				t.Fatal("rejected message was admitted")
+			}
+		})
+	}
+}
+
+type overloadedProcessor struct{}
+
+func (overloadedProcessor) Process(context.Context, eventstream.Event) { panic("Submit must be used") }
+
+func (overloadedProcessor) Submit(context.Context, eventstream.Event) error {
+	return eventprocessor.ErrOverloaded
+}
+
+func TestProcessorOverloadClosesWithRetryCode(t *testing.T) {
+	s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON), handlers.WithReadEventProcessor(overloadedProcessor{}))
+	conn := s.dial(t)
+	if err := conn.WriteJSON(testevent.New("overload")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := conn.ReadMessage()
+	if !libwebsocket.IsCloseError(err, libwebsocket.CloseTryAgainLater) {
+		t.Fatalf("overload did not close with 1013: %v", err)
+	}
+	if s.h.Stats().Incoming != 0 {
+		t.Fatal("overloaded message was admitted")
+	}
+}
+
+func TestOutboundLimitRejectsWithoutDeliveringPayload(t *testing.T) {
+	s := newHardeningServer(t, handlers.WithMaxOutboundBytes(64))
+	conn := s.dial(t)
+	select {
+	case <-s.bus.ready:
+	case <-time.After(time.Second):
+		t.Fatal("no subscription")
+	}
+	if err := s.bus.Publish(context.Background(), s.uid, testevent.New("outgoing")); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err := conn.ReadMessage()
+	if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) || len(data) != 0 {
+		t.Fatalf("oversized output was delivered: %q %v", data, err)
+	}
+	if s.h.Stats().Outgoing != 0 {
+		t.Fatal("oversized output counted as delivered")
+	}
+}
+
+func TestSubscriptionFailureSendsInternalClose(t *testing.T) {
+	cases := []struct {
+		name      string
+		subscribe func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error)
+	}{
+		{name: "nil channel", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+			//nolint:nilnil // Simulate a stream violating the Subscribe contract.
+			return nil, nil
+		}},
+		{name: "panic", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+			panic("subscription failed")
+		}},
+		{name: "error", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+			return nil, errors.New("subscription error")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newHardeningServer(t)
+			s.bus.subscribe = tc.subscribe
+			conn := s.dial(t)
+			_, _, err := conn.ReadMessage()
+			if !libwebsocket.IsCloseError(err, libwebsocket.CloseInternalServerErr) {
+				t.Fatalf("subscription failure did not close with 1011: %v", err)
+			}
+			if s.h.Stats().InternalClosed != 1 {
+				t.Fatal("subscription close was not counted")
+			}
+		})
+	}
+}
+
+type pendingUpgrader struct{ websocketstream.Upgrader }
+
+func (pendingUpgrader) UpgradeFastHTTP(*fasthttp.RequestCtx, libwebsocket.FastHTTPHandler) error {
+	return nil
+}
+
+func TestPendingUpgradeReleasesAdmission(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := inmem.New()
+		defer bus.Close()
+		u := pendingUpgrader{websocketstream.NewUpgrader([]string{testOrigin}, nil)}
+		h, err := handlers.NewHTTPHandler(handlers.NewOptions(slog.Default(), bus, u, nil, "uid",
+			handlers.WithMaxConnections(1), handlers.WithHandoffTimeout(time.Second)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer h.Close()
+		app := fiber.New()
+		ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
+		defer app.ReleaseCtx(ctx)
+		ctx.Locals("uid", eventstream.NewUserID())
+		if err := h.Serve(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if h.Stats().Active != 1 {
+			t.Fatal("pending upgrade did not reserve admission")
+		}
+		// Advance the handoff deadline using the bubble's virtual clock.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if stats := h.Stats(); stats.Active != 0 || stats.Accepted != 0 || bus.Stats().Subscribers != 0 {
+			t.Fatal("expired handoff retained work", stats)
+		}
+		if err := h.Serve(ctx); err != nil {
+			t.Fatal("expired handoff did not free admission", err)
+		}
+		if err := h.Shutdown(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if h.Stats().Active != 0 {
+			t.Fatal("shutdown retained a pending upgrade")
+		}
+	})
 }

@@ -34,7 +34,6 @@ type HTTPHandler struct {
 	closed                                                                             bool
 	wg                                                                                 sync.WaitGroup
 	stop, done                                                                         chan struct{}
-	watchOnce                                                                          sync.Once
 	accepted, rejected, incoming, outgoing, normalClosed, policyClosed, internalClosed atomic.Uint64
 }
 
@@ -67,15 +66,42 @@ func NewHTTPHandler(opts Options) (*HTTPHandler, error) {
 		}
 		owned, opts.readEventProcessor = processor, processor
 	}
-	return &HTTPHandler{
+	h := &HTTPHandler{
 		Options: opts, ownedProcessor: owned, active: make(map[*connection]struct{}),
 		stop: make(chan struct{}), done: make(chan struct{}),
-	}, nil
+	}
+	if h.shutdownCh != nil {
+		select {
+		case <-h.shutdownCh:
+			h.beginShutdown(context.Background())
+		default:
+			go func() {
+				select {
+				case <-h.stop:
+				case <-h.shutdownCh:
+					h.beginShutdown(context.Background())
+				}
+			}()
+		}
+	}
+	return h, nil
 }
 
 // Serve authenticates before upgrading. It retains only the resolved immutable
 // UserID, not Fiber's pooled request context or borrowed metadata.
 func (h *HTTPHandler) Serve(c fiber.Ctx) error {
+	select {
+	case <-h.shutdownCh:
+		h.beginShutdown(context.Background())
+	default:
+	}
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	if closed {
+		h.rejected.Add(1)
+		return fiber.ErrServiceUnavailable
+	}
 	var uid eventstream.UserID
 	err := safety.Call(func() error {
 		if h.userIDExtractor != nil {
@@ -95,30 +121,13 @@ func (h *HTTPHandler) Serve(c fiber.Ctx) error {
 		h.rejected.Add(1)
 		return fiber.ErrUnauthorized
 	}
-	h.watchOnce.Do(func() {
-		if h.shutdownCh != nil {
-			go func() {
-				select {
-				case <-h.stop:
-					return
-				case <-h.shutdownCh:
-					_ = h.Shutdown(context.Background())
-				}
-			}()
-		}
-	})
 	ctx, cancel := context.WithCancel(eventstream.WithUserID(context.Background(), uid))
 	state := &connection{handler: h, ctx: ctx, cancel: cancel}
-	h.mu.Lock()
-	if h.closed || len(h.active) >= h.maxConnections {
-		h.mu.Unlock()
+	if !h.admit(state) {
 		cancel()
 		h.rejected.Add(1)
 		return fiber.ErrServiceUnavailable
 	}
-	h.active[state] = struct{}{}
-	h.wg.Add(1)
-	h.mu.Unlock()
 	// A failed HTTP response may never invoke the hijack callback. Bound that
 	// pending handoff as well; a late callback only closes its socket.
 	state.mu.Lock()
@@ -162,19 +171,51 @@ func (h *HTTPHandler) Serve(c fiber.Ctx) error {
 	return nil
 }
 
+func (h *HTTPHandler) admit(state *connection) bool {
+	h.mu.Lock()
+	// Recheck after authentication: it can overlap shutdown-channel closure.
+	select {
+	case <-h.shutdownCh:
+		h.mu.Unlock()
+		h.beginShutdown(state.ctx)
+		return false
+	default:
+	}
+	defer h.mu.Unlock()
+	if h.closed || len(h.active) >= h.maxConnections {
+		return false
+	}
+	h.active[state] = struct{}{}
+	h.wg.Add(1)
+	return true
+}
+
 func (h *HTTPHandler) serveConnection(ctx context.Context, ws websocketstream.Websocket, uid eventstream.UserID) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	events, err := h.eventStream.Subscribe(ctx, uid)
+	var events <-chan eventstream.Event
+	err := safety.Call(func() error {
+		var err error
+		events, err = h.eventStream.Subscribe(ctx, uid)
+		return err
+	})
+	if err == nil && events == nil {
+		err = errors.New("event stream returned a nil subscription")
+	}
 	if err != nil {
+		h.internalClosed.Add(1)
 		newWsCloser(ws, h.closeTimeout).Close(context.WithoutCancel(ctx), libwebsocket.CloseInternalServerErr)
 		return err
 	}
-	if events == nil {
-		return errors.New("event stream returned a nil subscription")
-	}
-	if limiter, ok := ws.(interface{ SetReadLimit(limit int64) }); ok {
-		limiter.SetReadLimit(h.maxMessageBytes)
+	// Conn has no read-limit getter. Only adjust a known transport bound, so a
+	// custom upgrader's existing limit is never accidentally increased. Unknown
+	// transports still get the bounded wire/decoded reader in readLoop.
+	if provider, ok := h.upgrader.(interface{ ReadLimit() int64 }); ok {
+		if limit := provider.ReadLimit(); limit > 0 && h.maxMessageBytes < limit {
+			if limiter, ok := ws.(interface{ SetReadLimit(limit int64) }); ok {
+				limiter.SetReadLimit(h.maxMessageBytes)
+			}
+		}
 	}
 	results := make(chan error, 2)
 	go func() { results <- safety.Call(func() error { return h.readLoop(ctx, ws) }) }()
@@ -327,9 +368,7 @@ func (h *HTTPHandler) writeLoop(ctx context.Context, ws websocketstream.Websocke
 	}
 }
 
-// Shutdown closes active sockets, cancels their contexts and drains the owned
-// default processor. Injected processors/streams/loggers remain caller-owned.
-func (h *HTTPHandler) Shutdown(ctx context.Context) error {
+func (h *HTTPHandler) beginShutdown(ctx context.Context) {
 	h.mu.Lock()
 	if !h.closed {
 		h.closed = true
@@ -351,6 +390,12 @@ func (h *HTTPHandler) Shutdown(ctx context.Context) error {
 		}()
 	}
 	h.mu.Unlock()
+}
+
+// Shutdown closes active sockets, cancels their contexts and drains the owned
+// default processor. Injected processors/streams/loggers remain caller-owned.
+func (h *HTTPHandler) Shutdown(ctx context.Context) error {
+	h.beginShutdown(ctx)
 	select {
 	case <-h.done:
 		return nil

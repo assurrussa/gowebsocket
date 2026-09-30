@@ -60,6 +60,7 @@ func TestHTTPHandler(t *testing.T) {
 		handlers2.WithEventAdapter(eventAdapter{}),
 	))
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, h.Close()) })
 
 	// Создаем Fiber приложение для тестирования
 	app := fiber.New()
@@ -204,6 +205,7 @@ func TestWebSocketUpgrade(t *testing.T) {
 	require.NoError(t, err)
 
 	// Тестируем только создание хэндлера
+	t.Cleanup(func() { require.NoError(t, h.Close()) })
 	assert.NotNil(t, h)
 	t.Log("WebSocket handler created successfully")
 }
@@ -442,6 +444,7 @@ func TestGetUserIDVariations(t *testing.T) {
 				handlers2.WithEventAdapter(eventAdapter{}),
 			))
 			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, h.Close()) })
 
 			app := fiber.New()
 			app.Get("/ws", func(c fiber.Ctx) error {
