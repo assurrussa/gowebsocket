@@ -27,6 +27,7 @@ func service(t *testing.T) *inmem.Service {
 	})
 	return s
 }
+
 func receive(t *testing.T, events <-chan eventstream.Event) *testevent.Event {
 	t.Helper()
 	select {
@@ -44,7 +45,8 @@ func receive(t *testing.T, events <-chan eventstream.Event) *testevent.Event {
 		return nil
 	}
 }
-func subscribe(t *testing.T, s *inmem.Service, ctx context.Context, id eventstream.UserID) <-chan eventstream.Event {
+
+func subscribe(t *testing.T, ctx context.Context, s *inmem.Service, id eventstream.UserID) <-chan eventstream.Event {
 	t.Helper()
 	events, err := s.Subscribe(ctx, id)
 	if err != nil {
@@ -52,6 +54,7 @@ func subscribe(t *testing.T, s *inmem.Service, ctx context.Context, id eventstre
 	}
 	return events
 }
+
 func publish(t *testing.T, s *inmem.Service, id eventstream.UserID, body string) {
 	t.Helper()
 	if err := s.Publish(context.Background(), id, testevent.New(body)); err != nil {
@@ -62,7 +65,7 @@ func publish(t *testing.T, s *inmem.Service, id eventstream.UserID, body string)
 func TestSimpleSubscription(t *testing.T) {
 	s := service(t)
 	id := eventstream.NewUserID()
-	events := subscribe(t, s, context.Background(), id)
+	events := subscribe(t, context.Background(), s, id)
 	for _, body := range []string{"Hello", "World", "!"} {
 		publish(t, s, id, body)
 	}
@@ -76,7 +79,7 @@ func TestSimpleSubscription(t *testing.T) {
 func TestSimpleSubscriptionNeedClose(t *testing.T) {
 	s := service(t)
 	id := eventstream.NewUserID()
-	events := subscribe(t, s, context.Background(), id)
+	events := subscribe(t, context.Background(), s, id)
 	publish(t, s, id, "hello")
 	_ = receive(t, events)
 	if err := s.Close(); err != nil {
@@ -100,7 +103,9 @@ func TestEventIsMultiplexedToStreams(t *testing.T) {
 	s := service(t)
 	id := eventstream.NewUserID()
 	tabs := []<-chan eventstream.Event{
-		subscribe(t, s, context.Background(), id), subscribe(t, s, context.Background(), id), subscribe(t, s, context.Background(), id),
+		subscribe(t, context.Background(), s, id),
+		subscribe(t, context.Background(), s, id),
+		subscribe(t, context.Background(), s, id),
 	}
 	for i := 0; i < 5; i++ {
 		publish(t, s, id, strconv.Itoa(i))
@@ -129,7 +134,7 @@ func TestPublishWithoutSubscribers(t *testing.T) {
 	id := eventstream.NewUserID()
 	publish(t, s, id, "offline")
 	ctx, cancel := context.WithCancel(context.Background())
-	events := subscribe(t, s, ctx, id)
+	events := subscribe(t, ctx, s, id)
 	cancel()
 	for range events {
 	}
@@ -144,7 +149,7 @@ func TestPublishInDifferentUserStreams(t *testing.T) {
 	ids := []eventstream.UserID{eventstream.NewUserID(), eventstream.NewUserID(), eventstream.NewUserID()}
 	tabs := make([]<-chan eventstream.Event, len(ids))
 	for i, id := range ids {
-		tabs[i] = subscribe(t, s, context.Background(), id)
+		tabs[i] = subscribe(t, context.Background(), s, id)
 	}
 	for i, id := range ids {
 		publish(t, s, id, strconv.Itoa(i))
@@ -160,7 +165,7 @@ func TestChurnReleasesRegistry(t *testing.T) {
 	s := service(t)
 	for i := 0; i < 500; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
-		events := subscribe(t, s, ctx, eventstream.NewUserID())
+		events := subscribe(t, ctx, s, eventstream.NewUserID())
 		cancel()
 		for range events {
 		}
@@ -179,8 +184,8 @@ func TestSlowConsumerDoesNotBlockHealthySubscriber(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	id := eventstream.NewUserID()
-	slow := subscribe(t, s, context.Background(), id)
-	healthy := subscribe(t, s, context.Background(), id)
+	slow := subscribe(t, context.Background(), s, id)
+	healthy := subscribe(t, context.Background(), s, id)
 	evicted := false
 	for i := 0; i < 4; i++ {
 		err := s.Publish(context.Background(), id, testevent.New(strconv.Itoa(i)))
@@ -213,8 +218,8 @@ func TestSlowConsumerDoesNotBlockHealthySubscriber(t *testing.T) {
 func TestPublishOwnsSnapshot(t *testing.T) {
 	s := service(t)
 	id := eventstream.NewUserID()
-	first := subscribe(t, s, context.Background(), id)
-	second := subscribe(t, s, context.Background(), id)
+	first := subscribe(t, context.Background(), s, id)
+	second := subscribe(t, context.Background(), s, id)
 	input := testevent.New("original")
 	if err := s.Publish(context.Background(), id, input); err != nil {
 		t.Fatal(err)

@@ -11,20 +11,22 @@ import (
 )
 
 type EventAdapter interface {
-	Adapt(eventstream.Event) (any, error)
-	ReverseAdapt([]byte) (eventstream.Event, error)
+	Adapt(event eventstream.Event) (any, error)
+	ReverseAdapt(payload []byte) (eventstream.Event, error)
 }
 
 type ReadEventProcessor interface {
-	Process(context.Context, eventstream.Event)
+	Process(ctx context.Context, event eventstream.Event)
 }
 
 // EventSubmitter allows HTTPHandler to observe overload without blocking reads.
 type EventSubmitter interface {
-	Submit(context.Context, eventstream.Event) error
+	Submit(ctx context.Context, event eventstream.Event) error
 }
 
-type EventWriter interface{ Write(any, io.Writer) error }
+type EventWriter interface {
+	Write(event any, out io.Writer) error
+}
 
 // JSONEventWriter preserves the legacy raw []byte/string API, but validates the
 // JSON before writing. Prefer RawMessage or structured values in new code.

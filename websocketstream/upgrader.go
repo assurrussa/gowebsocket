@@ -17,19 +17,19 @@ import (
 // Websocket deliberately keeps the legacy interface. HTTPHandler discovers
 // SetReadLimit through an optional interface and always uses a bounded reader.
 type Websocket interface {
-	SetWriteDeadline(time.Time) error
-	NextWriter(int) (io.WriteCloser, error)
-	WriteMessage(int, []byte) error
-	WriteControl(int, []byte, time.Time) error
-	SetPongHandler(func(string) error)
-	SetReadDeadline(time.Time) error
+	SetWriteDeadline(t time.Time) error
+	NextWriter(messageType int) (io.WriteCloser, error)
+	WriteMessage(messageType int, data []byte) error
+	WriteControl(messageType int, data []byte, deadline time.Time) error
+	SetPongHandler(h func(string) error)
+	SetReadDeadline(t time.Time) error
 	NextReader() (int, io.Reader, error)
 	Close() error
 }
 
 type Upgrader interface {
-	Upgrade(http.ResponseWriter, *http.Request, http.Header) (Websocket, error)
-	UpgradeFastHTTP(*fasthttp.RequestCtx, libwebsocket.FastHTTPHandler) error
+	Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (Websocket, error)
+	UpgradeFastHTTP(ctx *fasthttp.RequestCtx, handler libwebsocket.FastHTTPHandler) error
 }
 
 type Config struct {
@@ -88,27 +88,33 @@ func NewUpgraderChecked(allowed, protocols []string, cfg Config) (Upgrader, erro
 	}
 	protocolCopy := append([]string(nil), protocols...)
 	return &upgraderImpl{
-		upgrader: &libwebsocket.Upgrader{HandshakeTimeout: cfg.HandshakeTimeout,
-			ReadBufferSize: 1024, WriteBufferSize: 1024,
+		upgrader: &libwebsocket.Upgrader{
+			HandshakeTimeout: cfg.HandshakeTimeout,
+			ReadBufferSize:   1024, WriteBufferSize: 1024,
 			CheckOrigin:  func(r *http.Request) bool { return matcher.Match(r.Header.Get("Origin")) },
-			Subprotocols: protocolCopy, EnableCompression: cfg.EnableCompression, WriteBufferPool: cfg.WriteBufferPool},
-		upgraderFastHTTP: &libwebsocket.FastHTTPUpgrader{HandshakeTimeout: cfg.HandshakeTimeout,
-			ReadBufferSize: 1024, WriteBufferSize: 1024,
-			CheckOrigin:  func(ctx *fasthttp.RequestCtx) bool { return matcher.Match(string(ctx.Request.Header.Peek("Origin"))) },
-			Subprotocols: append([]string(nil), protocols...), EnableCompression: cfg.EnableCompression, WriteBufferPool: cfg.WriteBufferPool},
+			Subprotocols: protocolCopy, EnableCompression: cfg.EnableCompression, WriteBufferPool: cfg.WriteBufferPool,
+		},
+		upgraderFastHTTP: &libwebsocket.FastHTTPUpgrader{
+			HandshakeTimeout: cfg.HandshakeTimeout,
+			ReadBufferSize:   1024, WriteBufferSize: 1024,
+			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
+				return matcher.Match(string(ctx.Request.Header.Peek("Origin")))
+			},
+			Subprotocols:      append([]string(nil), protocols...),
+			EnableCompression: cfg.EnableCompression,
+			WriteBufferPool:   cfg.WriteBufferPool,
+		},
 		recoverHandlerFastHTTP: cfg.RecoverHandler, readLimit: cfg.ReadLimit,
 	}, nil
 }
 
 func defaultRecover(conn *libwebsocket.Conn) {
-	if recover() != nil {
-		// Do not write a JSON data frame concurrently with the data writer, and do
-		// not return panic values (which may contain secrets) to the client.
-		slog.Error("websocket callback panicked")
-		_ = conn.WriteControl(libwebsocket.CloseMessage,
-			libwebsocket.FormatCloseMessage(libwebsocket.CloseInternalServerErr, ""), time.Now().Add(time.Second))
-		_ = conn.Close()
-	}
+	// Do not write a JSON data frame concurrently with the data writer, and do
+	// not return panic values (which may contain secrets) to the client.
+	slog.Error("websocket callback panicked")
+	_ = conn.WriteControl(libwebsocket.CloseMessage,
+		libwebsocket.FormatCloseMessage(libwebsocket.CloseInternalServerErr, ""), time.Now().Add(time.Second))
+	_ = conn.Close()
 }
 
 func (u *upgraderImpl) Upgrade(w http.ResponseWriter, r *http.Request, headers http.Header) (Websocket, error) {
@@ -131,8 +137,16 @@ func (u *upgraderImpl) UpgradeFastHTTP(ctx *fasthttp.RequestCtx, handler libwebs
 	}
 	return u.upgraderFastHTTP.Upgrade(ctx, func(conn *libwebsocket.Conn) {
 		defer conn.Close()
-		defer defaultRecover(conn) // Also contains a panic in a custom recovery handler.
-		defer u.recoverHandlerFastHTTP(conn)
+		defer func() {
+			if recover() != nil {
+				defaultRecover(conn)
+			}
+		}()
+		defer func() {
+			if recover() != nil {
+				u.recoverHandlerFastHTTP(conn)
+			}
+		}()
 		conn.SetReadLimit(u.readLimit)
 		handler(conn)
 	})

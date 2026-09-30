@@ -34,10 +34,12 @@ func TestBoundsAndDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
-	if err := p.Submit(workpool.Task{Context: context.Background(), Bytes: 16, Run: func(context.Context) error { return nil }}); err != nil {
+	task16 := workpool.Task{Context: context.Background(), Bytes: 16, Run: func(context.Context) error { return nil }}
+	if err := p.Submit(task16); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Submit(workpool.Task{Context: context.Background(), Bytes: 1, Run: func(context.Context) error { return nil }}); !errors.Is(err, bounded.ErrFull) {
+	task1 := workpool.Task{Context: context.Background(), Bytes: 1, Run: func(context.Context) error { return nil }}
+	if err := p.Submit(task1); !errors.Is(err, bounded.ErrFull) {
 		t.Fatalf("expected rejection: %v", err)
 	}
 	stats := p.Stats()
@@ -52,7 +54,7 @@ func TestBoundsAndDeadline(t *testing.T) {
 	if stats := p.Stats(); stats.Queued != 0 || stats.QueuedBytes != 0 {
 		t.Fatalf("pending work retained: %+v", stats)
 	}
-	if err := p.Submit(workpool.Task{Context: context.Background(), Bytes: 1, Run: func(context.Context) error { return nil }}); !errors.Is(err, bounded.ErrClosed) {
+	if err := p.Submit(task1); !errors.Is(err, bounded.ErrClosed) {
 		t.Fatal(err)
 	}
 }
@@ -103,7 +105,11 @@ func TestConcurrentAdmissionShutdown(t *testing.T) {
 			go func() {
 				defer writers.Done()
 				for j := 0; j < 20; j++ {
-					_ = p.Submit(workpool.Task{Context: context.Background(), Bytes: 0, Run: func(context.Context) error { handled.Add(1); return nil }})
+					task := workpool.Task{Context: context.Background(), Bytes: 0, Run: func(context.Context) error {
+						handled.Add(1)
+						return nil
+					}}
+					_ = p.Submit(task)
 				}
 			}()
 		}

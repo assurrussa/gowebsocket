@@ -13,6 +13,7 @@ import (
 )
 
 type Task struct {
+	//nolint:containedctx // Task carries per-job context.
 	Context context.Context
 	Run     func(context.Context) error
 	Bytes   int
@@ -30,8 +31,9 @@ type Stats struct {
 }
 
 type Pool struct {
-	queue                                                                     *bounded.Queue[Task]
-	cfg                                                                       Config
+	queue *bounded.Queue[Task]
+	cfg   Config
+	//nolint:containedctx // Pool carries lifecycle context.
 	ctx                                                                       context.Context
 	cancel                                                                    context.CancelFunc
 	done                                                                      chan struct{}
@@ -132,7 +134,9 @@ func (p *Pool) Close() { _ = p.Shutdown(context.Background()) }
 
 func (p *Pool) Stats() Stats {
 	n, b := p.queue.Stats()
-	return Stats{Queued: n, QueuedBytes: b, Active: p.active.Load(), Accepted: p.accepted.Load(),
+	return Stats{
+		Queued: n, QueuedBytes: b, Active: p.active.Load(), Accepted: p.accepted.Load(),
 		Rejected: p.rejected.Load(), Completed: p.completed.Load(), Failed: p.failed.Load(),
-		Panics: p.panics.Load(), Canceled: p.canceled.Load(), DurationNanos: p.duration.Load()}
+		Panics: p.panics.Load(), Canceled: p.canceled.Load(), DurationNanos: p.duration.Load(),
+	}
 }

@@ -27,8 +27,10 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{QueueCapacity: 64, QueueBytes: 1 << 20, MaxEventBytes: 64 << 10,
-		MaxSubscribers: 10000, MaxSubscribersPerUser: 16}
+	return Config{
+		QueueCapacity: 64, QueueBytes: 1 << 20, MaxEventBytes: 64 << 10,
+		MaxSubscribers: 10000, MaxSubscribersPerUser: 16,
+	}
 }
 
 type subscriber struct {
@@ -200,8 +202,10 @@ type Stats struct {
 func (s *Service) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stats := Stats{Users: len(s.subs), Subscribers: s.count, Published: s.published.Load(),
-		Delivered: s.delivered.Load(), Evicted: s.evicted.Load()}
+	stats := Stats{
+		Users: len(s.subs), Subscribers: s.count, Published: s.published.Load(),
+		Delivered: s.delivered.Load(), Evicted: s.evicted.Load(),
+	}
 	for _, group := range s.subs {
 		for sub := range group {
 			n, b := sub.queue.Stats()

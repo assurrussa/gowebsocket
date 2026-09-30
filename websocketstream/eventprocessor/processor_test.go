@@ -3,7 +3,6 @@ package eventprocessor_test
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -22,7 +21,10 @@ func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 type handlerFunc func(context.Context, eventstream.Event) error
 
 func (f handlerFunc) Handle(ctx context.Context, event eventstream.Event) error { return f(ctx, event) }
-func logger() *slog.Logger                                                      { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+const testEventType = "test"
+
+func logger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func Test_Init(t *testing.T) {
 	if _, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(nil)); err == nil {
@@ -35,13 +37,15 @@ func Test_Init(t *testing.T) {
 
 func TestSimpleSubscription(t *testing.T) {
 	var count atomic.Int64
-	handlers := map[string]eventprocessor.EventProcessor{"test": handlerFunc(func(context.Context, eventstream.Event) error { count.Add(1); return nil })}
+	handlers := map[string]eventprocessor.EventProcessor{
+		testEventType: handlerFunc(func(context.Context, eventstream.Event) error { count.Add(1); return nil }),
+	}
 	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(handlers)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	handlers["test"] = handlerFunc(func(context.Context, eventstream.Event) error { panic("registry must be cloned") })
+	handlers[testEventType] = handlerFunc(func(context.Context, eventstream.Event) error { panic("registry must be cloned") })
 	for i := 0; i < 3; i++ {
 		if err := p.Submit(context.Background(), testevent.New("body")); err != nil {
 			t.Fatal(err)
@@ -58,9 +62,10 @@ func TestSimpleSubscription(t *testing.T) {
 
 func TestInvalidAndUnknownEventsNeverRun(t *testing.T) {
 	var calls atomic.Int64
-	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
-		"test": handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
-	})))
+	procMap := map[string]eventprocessor.EventProcessor{
+		testEventType: handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
+	}
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(procMap)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,8 +90,8 @@ func TestIdentityAndCancellation(t *testing.T) {
 	id := eventstream.NewUserID()
 	got := make(chan eventstream.UserID, 1)
 	started := make(chan struct{})
-	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
-		"test": handlerFunc(func(ctx context.Context, _ eventstream.Event) error {
+	procMap := map[string]eventprocessor.EventProcessor{
+		testEventType: handlerFunc(func(ctx context.Context, _ eventstream.Event) error {
 			uid, ok := eventstream.UserIDFromContext(ctx)
 			if ok {
 				got <- uid
@@ -95,7 +100,8 @@ func TestIdentityAndCancellation(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		}),
-	})))
+	}
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(procMap)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,9 +129,10 @@ func TestIdentityAndCancellation(t *testing.T) {
 }
 
 func TestConcurrentClose(t *testing.T) {
-	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
-		"test": handlerFunc(func(context.Context, eventstream.Event) error { return nil }),
-	})))
+	procMap := map[string]eventprocessor.EventProcessor{
+		testEventType: handlerFunc(func(context.Context, eventstream.Event) error { return nil }),
+	}
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(procMap)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,9 +170,10 @@ func (e *admissionGateEvent) EventName() string {
 
 func TestAdmissionPausedAcrossClose(t *testing.T) {
 	var calls atomic.Int64
-	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
-		"test": handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
-	})))
+	procMap := map[string]eventprocessor.EventProcessor{
+		testEventType: handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
+	}
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(procMap)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,15 +31,19 @@ func metadata(values map[string]string, key string, fallback []string) string {
 	}
 	return value
 }
+
 func (c *Conn) Params(key string, fallback ...string) string {
 	return metadata(c.params, key, fallback)
 }
+
 func (c *Conn) Query(key string, fallback ...string) string {
 	return metadata(c.queries, key, fallback)
 }
+
 func (c *Conn) Cookies(key string, fallback ...string) string {
 	return metadata(c.cookies, key, fallback)
 }
+
 func (c *Conn) Headers(key string, fallback ...string) []string {
 	value, ok := c.headers[key]
 	if !ok {

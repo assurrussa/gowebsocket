@@ -18,7 +18,7 @@ import (
 //go:generate go run go.uber.org/mock/mockgen@v0.6.0 -source=processor.go -destination=mocks/processor_mock.gen.go -package=eventprocessormocks
 
 type EventProcessor interface {
-	Handle(context.Context, eventstream.Event) error
+	Handle(ctx context.Context, event eventstream.Event) error
 }
 
 var (
@@ -38,8 +38,10 @@ type Options struct {
 type OptOptionsSetter func(*Options)
 
 func NewOptions(logger eventstream.Logger, options ...OptOptionsSetter) Options {
-	o := Options{logger: logger, maxTimeWait: time.Second, workers: 1,
-		queueCapacity: 128, queueBytes: 2 << 20, maxEventBytes: 64 << 10}
+	o := Options{
+		logger: logger, maxTimeWait: time.Second, workers: 1,
+		queueCapacity: 128, queueBytes: 2 << 20, maxEventBytes: 64 << 10,
+	}
 	for _, option := range options {
 		if option != nil {
 			option(&o)
@@ -51,6 +53,7 @@ func NewOptions(logger eventstream.Logger, options ...OptOptionsSetter) Options 
 func WithProcessors(value map[string]EventProcessor) OptOptionsSetter {
 	return func(o *Options) { o.processors = maps.Clone(value) }
 }
+
 func WithMaxTimeWait(value time.Duration) OptOptionsSetter {
 	return func(o *Options) { o.maxTimeWait = value }
 }
@@ -58,6 +61,7 @@ func WithWorkers(value int) OptOptionsSetter { return func(o *Options) { o.worke
 func WithQueueLimits(messages, bytes int) OptOptionsSetter {
 	return func(o *Options) { o.queueCapacity, o.queueBytes = messages, bytes }
 }
+
 func WithMaxEventBytes(value int) OptOptionsSetter {
 	return func(o *Options) { o.maxEventBytes = value }
 }
@@ -94,11 +98,13 @@ func NewProcessor(opts Options) (*Processor, error) {
 		return nil, fmt.Errorf("validate options: %w", err)
 	}
 	opts.processors = maps.Clone(opts.processors)
-	pool, err := workpool.New(workpool.Config{Workers: opts.workers, Capacity: opts.queueCapacity,
+	pool, err := workpool.New(workpool.Config{
+		Workers: opts.workers, Capacity: opts.queueCapacity,
 		MaxBytes: opts.queueBytes, Timeout: opts.maxTimeWait, OnError: func(err error) {
 			// Error strings from domain callbacks may contain secrets. Do not log them.
 			opts.logger.ErrorContext(context.Background(), "event handler failed", "panic", errors.Is(err, safety.ErrPanic))
-		}})
+		},
+	})
 	if err != nil {
 		return nil, err
 	}

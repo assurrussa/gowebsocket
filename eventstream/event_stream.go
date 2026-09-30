@@ -67,7 +67,7 @@ func UserIDFromContext(ctx context.Context) (UserID, bool) {
 // Logger is satisfied by *slog.Logger and gologger.Logger. The library does not
 // own or close the logger and does not require a project-specific logging API.
 type Logger interface {
-	DebugContext(context.Context, string, ...any)
-	WarnContext(context.Context, string, ...any)
-	ErrorContext(context.Context, string, ...any)
+	DebugContext(ctx context.Context, msg string, args ...any)
+	WarnContext(ctx context.Context, msg string, args ...any)
+	ErrorContext(ctx context.Context, msg string, args ...any)
 }

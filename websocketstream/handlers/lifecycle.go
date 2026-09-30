@@ -10,8 +10,9 @@ import (
 
 // connection tracks admission even before FastHTTP invokes its hijack callback.
 type connection struct {
-	mu       sync.Mutex
-	handler  *HTTPHandler
+	mu      sync.Mutex
+	handler *HTTPHandler
+	//nolint:containedctx // Connection carries lifecycle context.
 	ctx      context.Context
 	cancel   context.CancelFunc
 	ws       websocketstream.Websocket

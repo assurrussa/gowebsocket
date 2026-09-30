@@ -12,14 +12,16 @@ import (
 )
 
 type EventAdapter interface {
-	Adapt(eventstream.Event) (any, error)
-	ReverseAdapt([]byte) (eventstream.Event, error)
+	Adapt(event eventstream.Event) (any, error)
+	ReverseAdapt(payload []byte) (eventstream.Event, error)
 }
 
 var ErrUnknownEventType = errors.New("unknown event type")
 
-type Options struct{ processors map[string]EventAdapter }
-type OptOptionsSetter func(*Options)
+type (
+	Options          struct{ processors map[string]EventAdapter }
+	OptOptionsSetter func(*Options)
+)
 
 func NewOptions(options ...OptOptionsSetter) Options {
 	var o Options
@@ -30,9 +32,11 @@ func NewOptions(options ...OptOptionsSetter) Options {
 	}
 	return o
 }
+
 func WithProcessors(value map[string]EventAdapter) OptOptionsSetter {
 	return func(o *Options) { o.processors = maps.Clone(value) }
 }
+
 func (o *Options) Validate() error {
 	for name, adapter := range o.processors {
 		if name == "" || safety.IsNil(adapter) {
@@ -115,6 +119,7 @@ func (*EventProcessor[T]) Adapt(event eventstream.Event) (result any, err error)
 	err = safety.Call(func() error { var err error; result, err = json.Marshal(event); return err })
 	return result, err
 }
+
 func (*EventProcessor[T]) ReverseAdapt(message []byte) (result eventstream.Event, err error) {
 	err = safety.Call(func() error {
 		var event T
@@ -144,6 +149,7 @@ type EnvelopeEventProcessor[T eventstream.Event] struct{}
 func NewEnvelopeEventProcessor[T eventstream.Event]() *EnvelopeEventProcessor[T] {
 	return &EnvelopeEventProcessor[T]{}
 }
+
 func (*EnvelopeEventProcessor[T]) Adapt(event eventstream.Event) (result any, err error) {
 	err = safety.Call(func() error {
 		raw, err := NewEventProcessor[T]().Adapt(event)
@@ -159,6 +165,7 @@ func (*EnvelopeEventProcessor[T]) Adapt(event eventstream.Event) (result any, er
 	})
 	return result, err
 }
+
 func (*EnvelopeEventProcessor[T]) ReverseAdapt(message []byte) (result eventstream.Event, err error) {
 	err = safety.Call(func() error {
 		var envelope Envelope

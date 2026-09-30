@@ -32,8 +32,10 @@ func New[T any](capacity, maxBytes int) (*Queue[T], error) {
 	if capacity <= 0 || maxBytes <= 0 {
 		return nil, errors.New("queue limits must be positive")
 	}
-	return &Queue[T]{items: make([]entry[T], capacity), maxBytes: maxBytes,
-		ready: make(chan struct{}, 1), closed: make(chan struct{})}, nil
+	return &Queue[T]{
+		items: make([]entry[T], capacity), maxBytes: maxBytes,
+		ready: make(chan struct{}, 1), closed: make(chan struct{}),
+	}, nil
 }
 
 func (q *Queue[T]) signal() {

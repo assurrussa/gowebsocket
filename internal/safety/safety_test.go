@@ -2,8 +2,9 @@ package safety_test
 
 import (
 	"errors"
-	"github.com/assurrussa/gowebsocket/internal/safety"
 	"testing"
+
+	"github.com/assurrussa/gowebsocket/internal/safety"
 )
 
 func TestPanicAndTypedNil(t *testing.T) {

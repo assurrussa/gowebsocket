@@ -1,8 +1,9 @@
 package origin_test
 
 import (
-	"github.com/assurrussa/gowebsocket/internal/origin"
 	"testing"
+
+	"github.com/assurrussa/gowebsocket/internal/origin"
 )
 
 func TestMatcher(t *testing.T) {
@@ -15,7 +16,11 @@ func TestMatcher(t *testing.T) {
 			t.Errorf("rejected %q", value)
 		}
 	}
-	for _, value := range []string{"", "null", "https://example.com.evil", "https://example.com@evil", "https://evil/path/example.com", "http://example.com", "https://a.example.org/", "https://a.example.org?x=1"} {
+	rejected := []string{
+		"", "null", "https://example.com.evil", "https://example.com@evil",
+		"https://evil/path/example.com", "http://example.com", "https://a.example.org/", "https://a.example.org?x=1",
+	}
+	for _, value := range rejected {
 		if matcher.Match(value) {
 			t.Errorf("accepted %q", value)
 		}
@@ -57,5 +62,5 @@ func FuzzMatcher(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	f.Fuzz(func(t *testing.T, input string) { _ = matcher.Match(input) })
+	f.Fuzz(func(_ *testing.T, input string) { _ = matcher.Match(input) })
 }

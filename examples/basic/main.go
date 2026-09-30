@@ -27,6 +27,8 @@ import (
 //go:embed index.html
 var page string
 
+const echoEventType = "echo"
+
 type echoEvent struct {
 	ID   eventstream.EventID `json:"eventId"`
 	Type string              `json:"eventType"`
@@ -36,7 +38,7 @@ type echoEvent struct {
 func (e *echoEvent) EventID() eventstream.EventID { return e.ID }
 func (e *echoEvent) EventName() string            { return e.Type }
 func (e *echoEvent) Validate() error {
-	if e == nil || e.ID.IsZero() || e.Type != "echo" || e.Body == "" || len(e.Body) > 4000 {
+	if e == nil || e.ID.IsZero() || e.Type != echoEventType || e.Body == "" || len(e.Body) > 4000 {
 		return errors.New("invalid echo event")
 	}
 	return nil
@@ -77,8 +79,8 @@ func run() error {
 			}
 			return uid, nil
 		}),
-		handlers.WithEventAdapters(map[string]eventadapter.EventAdapter{"echo": eventadapter.NewEventProcessor[*echoEvent]()}),
-		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{"echo": echoProcessor{bus: bus}}),
+		handlers.WithEventAdapters(map[string]eventadapter.EventAdapter{echoEventType: eventadapter.NewEventProcessor[*echoEvent]()}),
+		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{echoEventType: echoProcessor{bus: bus}}),
 	))
 	if err != nil {
 		return err

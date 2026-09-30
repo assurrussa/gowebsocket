@@ -67,8 +67,10 @@ func NewHTTPHandler(opts Options) (*HTTPHandler, error) {
 		}
 		owned, opts.readEventProcessor = processor, processor
 	}
-	return &HTTPHandler{Options: opts, ownedProcessor: owned, active: make(map[*connection]struct{}),
-		stop: make(chan struct{}), done: make(chan struct{})}, nil
+	return &HTTPHandler{
+		Options: opts, ownedProcessor: owned, active: make(map[*connection]struct{}),
+		stop: make(chan struct{}), done: make(chan struct{}),
+	}, nil
 }
 
 // Serve authenticates before upgrading. It retains only the resolved immutable
@@ -165,13 +167,13 @@ func (h *HTTPHandler) serveConnection(ctx context.Context, ws websocketstream.We
 	defer cancel()
 	events, err := h.eventStream.Subscribe(ctx, uid)
 	if err != nil {
-		newWsCloser(ws, h.closeTimeout).Close(context.Background(), libwebsocket.CloseInternalServerErr)
+		newWsCloser(ws, h.closeTimeout).Close(context.WithoutCancel(ctx), libwebsocket.CloseInternalServerErr)
 		return err
 	}
 	if events == nil {
 		return errors.New("event stream returned a nil subscription")
 	}
-	if limiter, ok := ws.(interface{ SetReadLimit(int64) }); ok {
+	if limiter, ok := ws.(interface{ SetReadLimit(limit int64) }); ok {
 		limiter.SetReadLimit(h.maxMessageBytes)
 	}
 	results := make(chan error, 2)
@@ -185,7 +187,7 @@ func (h *HTTPHandler) serveConnection(ctx context.Context, ws websocketstream.We
 	}
 	cancel()
 	code := closeCode(err)
-	newWsCloser(ws, h.closeTimeout).Close(context.Background(), code)
+	newWsCloser(ws, h.closeTimeout).Close(context.WithoutCancel(ctx), code)
 	// Close above interrupts NextReader/NextWriter before waiting for the pumps.
 	for i := 0; i < remaining; i++ {
 		<-results
@@ -336,13 +338,14 @@ func (h *HTTPHandler) Shutdown(ctx context.Context) error {
 		for state := range h.active {
 			states = append(states, state)
 		}
+		drainCtx := context.WithoutCancel(ctx)
 		go func() {
 			for _, state := range states {
 				state.stop()
 			}
 			h.wg.Wait()
 			if h.ownedProcessor != nil {
-				h.ownedProcessor.Close()
+				_ = h.ownedProcessor.Shutdown(drainCtx)
 			}
 			close(h.done)
 		}()
@@ -375,7 +378,9 @@ func (h *HTTPHandler) Stats() Stats {
 	h.mu.Lock()
 	active := len(h.active)
 	h.mu.Unlock()
-	return Stats{Active: active, Accepted: h.accepted.Load(), Rejected: h.rejected.Load(),
+	return Stats{
+		Active: active, Accepted: h.accepted.Load(), Rejected: h.rejected.Load(),
 		Incoming: h.incoming.Load(), Outgoing: h.outgoing.Load(), NormalClosed: h.normalClosed.Load(),
-		PolicyClosed: h.policyClosed.Load(), InternalClosed: h.internalClosed.Load()}
+		PolicyClosed: h.policyClosed.Load(), InternalClosed: h.internalClosed.Load(),
+	}
 }

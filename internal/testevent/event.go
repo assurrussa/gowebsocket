@@ -3,6 +3,7 @@ package testevent
 
 import (
 	"errors"
+
 	"github.com/assurrussa/gowebsocket/eventstream"
 )
 

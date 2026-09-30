@@ -72,6 +72,11 @@ func (s *readyStream) Subscribe(ctx context.Context, id eventstream.UserID) (<-c
 	return events, err
 }
 
+const (
+	testOrigin   = "http://localhost"
+	originHeader = "Origin"
+)
+
 type testServer struct {
 	h         *handlers.HTTPHandler
 	bus       *readyStream
@@ -82,16 +87,21 @@ type testServer struct {
 
 func newHardeningServer(t *testing.T, options ...handlers.OptOptionsSetter) *testServer {
 	t.Helper()
-	s := &testServer{uid: eventstream.NewUserID(), processed: make(chan checkedEvent, 16), bus: &readyStream{Service: inmem.New(), ready: make(chan struct{})}}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	defaults := []handlers.OptOptionsSetter{
+	s := &testServer{
+		uid:       eventstream.NewUserID(),
+		processed: make(chan checkedEvent, 16),
+		bus:       &readyStream{Service: inmem.New(), ready: make(chan struct{})},
+	}
+	log := slog.New(slog.DiscardHandler)
+	defaults := make([]handlers.OptOptionsSetter, 0, 2+len(options))
+	defaults = append(defaults,
 		handlers.WithEventAdapters(map[string]eventadapter.EventAdapter{"test": eventadapter.NewEventProcessor[*testevent.Event]()}),
 		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{"test": checkedProcessor{output: s.processed}}),
-	}
+	)
 	defaults = append(defaults, options...)
+	upgrader := websocketstream.NewUpgrader([]string{testOrigin}, nil, websocketstream.Config{EnableCompression: true})
 	var err error
-	s.h, err = handlers.NewHTTPHandler(handlers.NewOptions(log, s.bus,
-		websocketstream.NewUpgrader([]string{"http://localhost"}, nil, websocketstream.Config{EnableCompression: true}), nil, "uid", defaults...))
+	s.h, err = handlers.NewHTTPHandler(handlers.NewOptions(log, s.bus, upgrader, nil, "uid", defaults...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +113,11 @@ func newHardeningServer(t *testing.T, options ...handlers.OptOptionsSetter) *tes
 		defer close(exited)
 		_ = app.Listener(listener, fiber.ListenConfig{DisableStartupMessage: true})
 	}()
-	s.dialer = &libwebsocket.Dialer{NetDial: func(string, string) (net.Conn, error) { return listener.Dial() }, HandshakeTimeout: 2 * time.Second, EnableCompression: true}
+	s.dialer = &libwebsocket.Dialer{
+		NetDial:           func(string, string) (net.Conn, error) { return listener.Dial() },
+		HandshakeTimeout:  2 * time.Second,
+		EnableCompression: true,
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -126,7 +140,7 @@ func newHardeningServer(t *testing.T, options ...handlers.OptOptionsSetter) *tes
 
 func (s *testServer) dial(t *testing.T) *libwebsocket.Conn {
 	t.Helper()
-	header := http.Header{"Origin": []string{"http://localhost"}}
+	header := http.Header{originHeader: []string{testOrigin}}
 	conn, response, err := s.dialer.Dial("ws://localhost/ws", header)
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
@@ -216,7 +230,7 @@ func TestIdentityRejectedBeforeUpgrade(t *testing.T) {
 	s := newHardeningServer(t, handlers.WithUserIDExtractor(func(fiber.Ctx) (eventstream.UserID, error) {
 		return eventstream.UserIDNil, errors.New("invalid session")
 	}))
-	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{"Origin": []string{"http://localhost"}})
+	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
 	if conn != nil {
 		_ = conn.Close()
 	}
@@ -233,7 +247,7 @@ func TestIdentityRejectedBeforeUpgrade(t *testing.T) {
 
 func TestOriginStatusPreserved(t *testing.T) {
 	s := newHardeningServer(t)
-	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{"Origin": []string{"https://not-allowed.example"}})
+	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{"https://not-allowed.example"}})
 	if conn != nil {
 		_ = conn.Close()
 	}
@@ -279,7 +293,7 @@ func TestWriterFailureUnblocksReader(t *testing.T) {
 func TestNormalCloseAndConnectionLimit(t *testing.T) {
 	s := newHardeningServer(t, handlers.WithMaxConnections(1))
 	conn := s.dial(t)
-	extra, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{"Origin": []string{"http://localhost"}})
+	extra, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
 	if extra != nil {
 		_ = extra.Close()
 	}
@@ -289,7 +303,8 @@ func TestNormalCloseAndConnectionLimit(t *testing.T) {
 	if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("connection limit not enforced: %v %v", response, err)
 	}
-	if err := conn.WriteControl(libwebsocket.CloseMessage, libwebsocket.FormatCloseMessage(libwebsocket.CloseNormalClosure, ""), time.Now().Add(time.Second)); err != nil {
+	closePayload := libwebsocket.FormatCloseMessage(libwebsocket.CloseNormalClosure, "")
+	if err := conn.WriteControl(libwebsocket.CloseMessage, closePayload, time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = conn.ReadMessage()
@@ -307,7 +322,7 @@ func TestZeroPingRejected(t *testing.T) {
 	bus := inmem.New()
 	defer bus.Close()
 	_, err := handlers.NewHTTPHandler(handlers.NewOptions(slog.Default(), bus,
-		websocketstream.NewUpgrader([]string{"http://localhost"}, nil), nil, "uid", handlers.WithPingPeriod(0)))
+		websocketstream.NewUpgrader([]string{testOrigin}, nil), nil, "uid", handlers.WithPingPeriod(0)))
 	if err == nil {
 		t.Fatal("zero ping accepted")
 	}

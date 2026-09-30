@@ -31,7 +31,7 @@ func TestHTTPHandler(t *testing.T) {
 
 		pingInterval = eventInterval / 4
 
-		origin = "http://localhost"
+		origin = testOrigin
 
 		headerSecWsProtocol = "Sec-WebSocket-Protocol"
 		secWsProtocol       = "chat-service-protocol.test"
@@ -286,7 +286,6 @@ func (s customSessionWithEventstreamUserID) GetUUID() eventstream.UserID {
 }
 
 func TestGetUserIDVariations(t *testing.T) {
-	origin := "http://localhost"
 	log := logger.Default().WithNamed("TestGetUserIDVariations")
 	uid := eventstream.NewUserID()
 	rawUUID := uuid.UUID(uid)
@@ -435,7 +434,7 @@ func TestGetUserIDVariations(t *testing.T) {
 			h, err := handlers2.NewHTTPHandler(handlers2.NewOptions(
 				log,
 				mockES,
-				websocketstream.NewUpgrader([]string{origin}, []string{}),
+				websocketstream.NewUpgrader([]string{testOrigin}, []string{}),
 				shutdownCh,
 				"user_key",
 				handlers2.WithPingPeriod(time.Second),
@@ -472,7 +471,7 @@ func TestGetUserIDVariations(t *testing.T) {
 			}
 
 			header := http.Header{}
-			header.Add("Origin", origin)
+			header.Add(originHeader, testOrigin)
 			c, resp, dialErr := dialer.DialContext(ctx, "ws://localhost/ws", header)
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()

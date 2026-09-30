@@ -10,9 +10,11 @@ import (
 	"github.com/assurrussa/gowebsocket/internal/safety"
 )
 
-type userWithEventstreamUUID interface{ GetUUID() eventstream.UserID }
-type userWithUUIDUUID interface{ GetUUID() uuid.UUID }
-type userWithStringUUID interface{ GetUUID() string }
+type (
+	userWithEventstreamUUID interface{ GetUUID() eventstream.UserID }
+	userWithUUIDUUID        interface{ GetUUID() uuid.UUID }
+	userWithStringUUID      interface{ GetUUID() string }
+)
 
 func toUserID(value any) (eventstream.UserID, bool) {
 	if safety.IsNil(value) {
@@ -68,7 +70,7 @@ func (h *HTTPHandler) getUserID(conn *Conn) (eventstream.UserID, bool) {
 	return toUserID(value)
 }
 
-func getUserIDByReflection(value any) (eventstream.UserID, bool, bool) {
+func getUserIDByReflection(value any) (id eventstream.UserID, valid bool, found bool) {
 	if safety.IsNil(value) {
 		return eventstream.UserIDNil, false, false
 	}
