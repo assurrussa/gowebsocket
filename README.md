@@ -30,11 +30,12 @@ changing repository visibility is a separate maintainer decision.
 
 ## Wire compatibility
 
-The existing constructor keeps **base64(JSON) input and plain JSON output**.
-Existing clients do not silently switch protocol. New endpoints should opt in:
+The handler defaults to **plain JSON input and output**.
+
+To support legacy clients that wrap JSON messages in base64, opt in explicitly:
 
 ```go
-handlers.WithWireFormat(handlers.JSON)
+handlers.WithWireFormat(handlers.LegacyBase64)
 ```
 
 The default flat event must contain an `eventType` property; the `EventName()`
@@ -150,7 +151,16 @@ supports non-browser clients; Origin itself is not authentication.
 `NewUpgraderChecked` reports invalid configuration at startup. HTTP upgrade
 errors retain their original status instead of becoming 426.
 
-Configure HTTP read/write deadlines in the host Fiber/FastHTTP server as well.
+Configure HTTP read/write deadlines in the host Fiber/FastHTTP server as well:
+
+```go
+app := fiber.New(fiber.Config{
+	ReadTimeout:  10 * time.Second,
+	WriteTimeout: 10 * time.Second,
+	IdleTimeout:  120 * time.Second,
+})
+```
+
 FastHTTP's upgrader in the pinned version does not apply HandshakeTimeout to
 the HTTP response write; the handler's handoff timeout releases its admission
 slot but cannot interrupt a response still owned by the HTTP server.

@@ -50,8 +50,8 @@ type Options struct {
 
 type OptOptionsSetter func(*Options)
 
-// NewOptions preserves the existing constructor and defaults to the legacy
-// base64(JSON) inbound format. A nil shutdown channel allows explicit Shutdown.
+// NewOptions preserves the existing constructor and defaults to the plain
+// JSON inbound format. A nil shutdown channel allows explicit Shutdown.
 func NewOptions(logger eventstream.Logger, stream eventStream, upgrader websocketstream.Upgrader,
 	shutdown <-chan struct{}, userKey string, options ...OptOptionsSetter,
 ) Options {
@@ -60,7 +60,7 @@ func NewOptions(logger eventstream.Logger, stream eventStream, upgrader websocke
 		userIDCtxKey: userKey, pingPeriod: 10 * time.Second, writeTimeout: 5 * time.Second,
 		closeTimeout: time.Second, processTimeout: time.Second, handoffTimeout: 5 * time.Second,
 		maxMessageBytes: 96 << 10, maxDecodedBytes: 64 << 10, maxOutboundBytes: 96 << 10,
-		maxConnections: 10000, wireFormat: LegacyBase64,
+		maxConnections: 10000, wireFormat: JSON,
 	}
 	for _, option := range options {
 		if option != nil {

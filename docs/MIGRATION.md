@@ -11,9 +11,9 @@ that variable's parameter type.
 - Close/Shutdown is terminal. Publish/Subscribe/Submit reject work after closure.
   Cancel individual subscriptions with their context; do not use Close as Wait.
 - Input must validate and use text frames. Invalid, unknown and oversized input
-  terminates the connection. Base64(JSON) remains the default input format.
-- New JSON endpoints must explicitly set WithWireFormat(handlers.JSON). There is
-  no heuristic fallback that might reinterpret malformed input.
+  terminates the connection. Plain JSON is now the default input format.
+- Legacy base64(JSON) endpoints must explicitly set WithWireFormat(handlers.LegacyBase64).
+  There is no heuristic fallback that might reinterpret malformed input.
 - Events must round-trip through JSON. Publish/Submit now take owned snapshots,
   not shared references to mutable application objects. Each recipient gets a
   fresh value. Put hidden application state outside the transport event.

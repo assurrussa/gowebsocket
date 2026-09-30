@@ -72,7 +72,6 @@ func run() error {
 		return err
 	}
 	h, err := handlers.NewHTTPHandler(handlers.NewOptions(slog.Default(), bus, upgrader, nil, "",
-		handlers.WithWireFormat(handlers.JSON),
 		handlers.WithUserIDExtractor(func(c fiber.Ctx) (eventstream.UserID, error) {
 			if subtle.ConstantTimeCompare([]byte(c.Cookies("demo_session")), []byte(token)) != 1 {
 				return eventstream.UserIDNil, errors.New("invalid demo session")
@@ -86,7 +85,11 @@ func run() error {
 		return err
 	}
 	defer h.Close()
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	})
 	app.Get("/", func(c fiber.Ctx) error {
 		// Demo session only, not an authentication system. Bind to loopback and
 		// replace this with real application authentication before deployment.

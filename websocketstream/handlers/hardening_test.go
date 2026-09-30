@@ -175,7 +175,7 @@ func (s *testServer) dial(t *testing.T) *libwebsocket.Conn {
 }
 
 func TestInboundJSONAndTrustedIdentity(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON))
+	s := newHardeningServer(t)
 	conn := s.dial(t)
 	event := testevent.New("client message")
 	event.UserID = eventstream.NewUserID()
@@ -193,7 +193,7 @@ func TestInboundJSONAndTrustedIdentity(t *testing.T) {
 }
 
 func TestLegacyBase64StillWorks(t *testing.T) {
-	s := newHardeningServer(t)
+	s := newHardeningServer(t, handlers.WithWireFormat(handlers.LegacyBase64))
 	conn := s.dial(t)
 	encoded, err := json.Marshal(testevent.New("legacy"))
 	if err != nil {
