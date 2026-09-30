@@ -1,8 +1,38 @@
 .DEFAULT_GOAL := check
-GO_MODULE := $(shell go list -m)
-GO_FILES := $(shell find . -type f -name '*.go')
+GOLANGCI_VERSION := v2.14.0
+export GOFLAGS ?= -mod=readonly
+GO_FILES := $(shell find . -type f -name '*.go' -not -path './vendor/*')
 
-check: tidy generate fmt vet lint test test-race cover-html
+.PHONY: check fmt-check vet lint test test-race examples consumer fix fmt tidy generate bench-all cover-html
+
+check: fmt-check vet lint test test-race examples consumer
+
+fmt-check:
+	@test -z "$$(gofmt -l $(GO_FILES))" || (gofmt -l $(GO_FILES); exit 1)
+
+vet:
+	go vet ./...
+
+lint:
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION) run --timeout=5m ./...
+
+test:
+	go test -timeout=3m ./...
+
+test-race:
+	go test -race -count=5 -timeout=5m ./...
+
+examples:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; go build -o "$$tmp/" ./examples/...
+
+consumer:
+	bash scripts/test-consumer.sh
+
+fix:
+	gofmt -w $(GO_FILES)
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION) fmt
+
+fmt: fix
 
 tidy:
 	go mod tidy
@@ -10,26 +40,9 @@ tidy:
 generate:
 	go generate ./...
 
-fmt:
-	go fmt ./...
-	gofumpt -l -w $(GO_FILES)
-	gci write -s standard -s default -s "prefix($(GO_MODULE))" .
-
-lint:
-	golangci-lint run -v --fix --timeout=5m ./...
-
-vet:
-	go vet ./...
-
-test:
-	go test ./...
-
-test-race:
-	go test -race -count=5 ./...
-
 bench-all:
-	go test -bench=. -benchmem ./...
+	go test -run='^$$' -bench=. -benchmem ./...
 
 cover-html:
-	@go test -coverprofile=./coverage.text -covermode=atomic $(shell go list ./...)
-	@go tool cover -html=./coverage.text -o ./cover.html && rm ./coverage.text
+	go test -coverprofile=coverage.out -covermode=atomic ./...
+	go tool cover -html=coverage.out -o cover.html

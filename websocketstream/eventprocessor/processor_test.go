@@ -1,176 +1,194 @@
 package eventprocessor_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	logger "github.com/assurrussa/gologger"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
-	"go.uber.org/mock/gomock"
+	"go.uber.org/goleak"
 
-	eventstream "github.com/assurrussa/gowebsocket/eventstream"
-	eventprocessor2 "github.com/assurrussa/gowebsocket/websocketstream/eventprocessor"
-	eventprocessormocks "github.com/assurrussa/gowebsocket/websocketstream/eventprocessor/mocks"
+	"github.com/assurrussa/gowebsocket/eventstream"
+	"github.com/assurrussa/gowebsocket/internal/testevent"
+	"github.com/assurrussa/gowebsocket/websocketstream/eventprocessor"
 )
 
-type TestSuite struct {
-	suite.Suite
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
-	ctrl                *gomock.Controller
-	eventProcessorMock  *eventprocessormocks.MockEventProcessor
-	eventProcessorMock2 *eventprocessormocks.MockEventProcessor
+type handlerFunc func(context.Context, eventstream.Event) error
 
-	bf        *bytes.Buffer
-	processor *eventprocessor2.Processor
-}
-
-func newTestSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
-	t.Helper()
-	t.Parallel()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	bf := bytes.NewBuffer(nil)
-
-	ctrl := gomock.NewController(t)
-	eventProcessorMock := eventprocessormocks.NewMockEventProcessor(ctrl)
-	eventProcessorMock2 := eventprocessormocks.NewMockEventProcessor(ctrl)
-
-	prs := map[string]eventprocessor2.EventProcessor{
-		testEventName1: eventProcessorMock,
-		testEventName2: eventProcessorMock2,
-	}
-
-	processorService, err := eventprocessor2.NewProcessor(eventprocessor2.NewOptions(
-		logger.DiscardJSONWithWriter(bf),
-		eventprocessor2.WithProcessors(prs),
-		eventprocessor2.WithMaxTimeWait(time.Millisecond*100),
-	))
-	require.NoError(t, err)
-
-	ts := &TestSuite{
-		bf:                  bf,
-		ctrl:                ctrl,
-		eventProcessorMock:  eventProcessorMock,
-		eventProcessorMock2: eventProcessorMock2,
-		processor:           processorService,
-	}
-	ts.SetT(t)
-
-	return ctx, cancel, ts
-}
+func (f handlerFunc) Handle(ctx context.Context, event eventstream.Event) error { return f(ctx, event) }
+func logger() *slog.Logger                                                      { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func Test_Init(t *testing.T) {
-	assert.NotPanics(t, func() {
-		p, err := eventprocessor2.NewProcessor(eventprocessor2.NewOptions(nil))
-		require.Error(t, err)
-		assert.Nil(t, p)
-	})
+	if _, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(nil)); err == nil {
+		t.Fatal("nil logger accepted")
+	}
+	if _, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithMaxTimeWait(0))); err == nil {
+		t.Fatal("zero timeout accepted")
+	}
 }
 
 func TestSimpleSubscription(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestSuite(t)
-	defer cancel()
-
-	ts.eventProcessorMock.EXPECT().Handle(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ eventstream.Event) error {
-			return nil
-		}).Times(2)
-
-	ts.eventProcessorMock2.EXPECT().Handle(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ eventstream.Event) error {
-			return errors.New("error expected")
-		}).Times(1)
-
-	event := newTestEvent("test body 1")
-	ts.processor.Process(ctx, event)
-
-	event2 := newTestEvent2("test body 2")
-	ts.processor.Process(ctx, event2)
-
-	event = newTestEvent("test body 3")
-	ts.processor.Process(ctx, event)
-
-	go func() {
-		for i := 0; i < 5; i++ {
-			event = newTestEvent("test body 3")
-			ts.processor.Process(ctx, event)
+	var count atomic.Int64
+	handlers := map[string]eventprocessor.EventProcessor{"test": handlerFunc(func(context.Context, eventstream.Event) error { count.Add(1); return nil })}
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(handlers)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	handlers["test"] = handlerFunc(func(context.Context, eventstream.Event) error { panic("registry must be cloned") })
+	for i := 0; i < 3; i++ {
+		if err := p.Submit(context.Background(), testevent.New("body")); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	ts.processor.Close()
-
-	body := ts.bf.String()
-	ts.NotEmpty(body)
-}
-
-const (
-	testEventName1 = "testEvent"
-	testEventName2 = "testEvent2"
-)
-
-type testEvent struct {
-	ID          eventstream.EventID `validate:"required"`
-	MessageBody string              `validate:"required,max=3000"`
-}
-
-func (t *testEvent) EventID() eventstream.EventID {
-	return t.ID
-}
-
-func (t *testEvent) EventName() string {
-	return testEventName1
-}
-
-func (t *testEvent) Validate() error {
-	if t.ID.IsZero() {
-		return errors.New("id is required")
 	}
-	if t.MessageBody == "" {
-		return errors.New("message body is required")
+	p.Close()
+	if count.Load() != 3 || p.Stats().Panics != 0 {
+		t.Fatal(count.Load(), p.Stats())
 	}
-	return nil
-}
-
-func newTestEvent(body string) eventstream.Event {
-	return &testEvent{
-		ID:          eventstream.NewEventID(),
-		MessageBody: body,
+	if err := p.Submit(context.Background(), testevent.New("after close")); !errors.Is(err, eventprocessor.ErrClosed) {
+		t.Fatal(err)
 	}
 }
 
-type testEvent2 struct {
-	ID          eventstream.EventID `validate:"required"`
-	MessageBody string              `validate:"required,max=3000"`
-}
-
-func (t *testEvent2) EventID() eventstream.EventID {
-	return t.ID
-}
-
-func (t *testEvent2) EventName() string {
-	return testEventName2
-}
-
-func (t *testEvent2) Validate() error {
-	if t.ID.IsZero() {
-		return errors.New("id is required")
+func TestInvalidAndUnknownEventsNeverRun(t *testing.T) {
+	var calls atomic.Int64
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
+		"test": handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
+	})))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if t.MessageBody == "" {
-		return errors.New("message body is required")
+	defer p.Close()
+	for _, event := range []eventstream.Event{nil, (*testevent.Event)(nil), &testevent.Event{}} {
+		if err := p.Submit(context.Background(), event); err == nil {
+			t.Fatal("invalid event admitted")
+		}
 	}
-	return nil
+	unknown := testevent.New("body")
+	unknown.Type = "unknown"
+	if err := p.Submit(context.Background(), unknown); !errors.Is(err, eventprocessor.ErrUnknownEvent) {
+		t.Fatal(err)
+	}
+	p.Close()
+	if calls.Load() != 0 {
+		t.Fatal("invalid callback executed")
+	}
 }
 
-func newTestEvent2(body string) eventstream.Event {
-	return &testEvent2{
-		ID:          eventstream.NewEventID(),
-		MessageBody: body,
+func TestIdentityAndCancellation(t *testing.T) {
+	id := eventstream.NewUserID()
+	got := make(chan eventstream.UserID, 1)
+	started := make(chan struct{})
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
+		"test": handlerFunc(func(ctx context.Context, _ eventstream.Event) error {
+			uid, ok := eventstream.UserIDFromContext(ctx)
+			if ok {
+				got <- uid
+			}
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx, cancel := context.WithCancel(eventstream.WithUserID(context.Background(), id))
+	defer cancel()
+	if err := p.Submit(ctx, testevent.New("body")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("not started")
+	}
+	cancel()
+	p.Close()
+	select {
+	case uid := <-got:
+		if uid != id {
+			t.Fatal(uid)
+		}
+	default:
+		t.Fatal("trusted identity lost")
+	}
+}
+
+func TestConcurrentClose(t *testing.T) {
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
+		"test": handlerFunc(func(context.Context, eventstream.Event) error { return nil }),
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	var wg sync.WaitGroup
+	wg.Add(8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_ = p.Submit(context.Background(), testevent.New("body"))
+			}
+		}()
+	}
+	p.Close()
+	before := p.Stats().Completed
+	wg.Wait()
+	if p.Stats().Completed != before {
+		t.Fatal("processing after Close")
+	}
+}
+
+type admissionGateEvent struct {
+	*testevent.Event
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (e *admissionGateEvent) EventName() string {
+	if e.entered != nil {
+		e.once.Do(func() { close(e.entered); <-e.release })
+	}
+	return e.Event.EventName()
+}
+
+func TestAdmissionPausedAcrossClose(t *testing.T) {
+	var calls atomic.Int64
+	p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(logger(), eventprocessor.WithProcessors(map[string]eventprocessor.EventProcessor{
+		"test": handlerFunc(func(context.Context, eventstream.Event) error { calls.Add(1); return nil }),
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	event := &admissionGateEvent{Event: testevent.New("body"), entered: make(chan struct{}), release: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() { result <- p.Submit(context.Background(), event) }()
+	select {
+	case <-event.entered:
+	case <-time.After(time.Second):
+		t.Fatal("admission did not reach gate")
+	}
+	p.Close()
+	close(event.release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, eventprocessor.ErrClosed) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission remained blocked")
+	}
+	if calls.Load() != 0 {
+		t.Fatal("handler ran after completed Close")
 	}
 }

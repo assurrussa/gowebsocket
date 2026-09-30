@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gowebsocket — local echo</title>
+<style>
+body{font:16px system-ui;max-width:760px;margin:4rem auto;padding:0 1rem}input{width:70%;padding:.6rem}button{padding:.6rem}pre{white-space:pre-wrap;background:#f3f4f6;padding:1rem}small{display:block;margin:1rem 0}
+</style>
+<h1>gowebsocket</h1>
+<p>Local JSON echo. The server derives your identity from its demo session, not this message.</p>
+<p id="status">Connecting…</p>
+<form id="form"><input id="body" maxlength="1000" value="Hello WebSocket" aria-label="Message"><button id="send" disabled>Send</button></form>
+<small>This example has no durable history or automatic replay. Reload to reconnect.</small>
+<pre id="output" aria-live="polite"></pre>
+<script>
+'use strict';
+const status = document.getElementById('status');
+const output = document.getElementById('output');
+const send = document.getElementById('send');
+const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+ws.onopen = () => { status.textContent = 'Connected'; send.disabled = false; };
+ws.onmessage = ({data}) => { output.textContent = JSON.stringify(JSON.parse(data), null, 2); };
+ws.onerror = () => { status.textContent = 'Connection error'; };
+ws.onclose = ({code}) => { status.textContent = `Closed (${code}). Reload to reconnect.`; send.disabled = true; };
+document.getElementById('form').onsubmit = (event) => {
+  event.preventDefault();
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({eventId: crypto.randomUUID(), eventType: 'echo', body: document.getElementById('body').value}));
+};
+</script>
+</html>

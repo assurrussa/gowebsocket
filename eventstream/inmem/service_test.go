@@ -4,347 +4,268 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/suite"
 	"go.uber.org/goleak"
 
-	eventstream "github.com/assurrussa/gowebsocket/eventstream"
-	inmemeventstream "github.com/assurrussa/gowebsocket/eventstream/inmem"
+	"github.com/assurrussa/gowebsocket/eventstream"
+	inmem "github.com/assurrussa/gowebsocket/eventstream/inmem"
+	"github.com/assurrussa/gowebsocket/internal/testevent"
 )
 
-var defaultBodies = []string{"Hello", "World", "!"}
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
-
-type TestSuite struct {
-	suite.Suite
-
-	stream eventstream.EventStream
-}
-
-func newTestRepoSuite(t *testing.T) (context.Context, context.CancelFunc, *TestSuite) {
+func service(t *testing.T) *inmem.Service {
 	t.Helper()
-	t.Parallel()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	stream := inmemeventstream.New()
+	s := inmem.New()
 	t.Cleanup(func() {
-		assert.NoError(t, stream.Close())
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
 	})
-
-	ts := &TestSuite{
-		stream: stream,
+	return s
+}
+func receive(t *testing.T, events <-chan eventstream.Event) *testevent.Event {
+	t.Helper()
+	select {
+	case event, ok := <-events:
+		if !ok {
+			t.Fatal("subscription closed unexpectedly")
+		}
+		typed, ok := event.(*testevent.Event)
+		if !ok {
+			t.Fatalf("unexpected event %T", event)
+		}
+		return typed
+	case <-time.After(2 * time.Second):
+		t.Fatal("event delivery timeout")
+		return nil
 	}
-	ts.SetT(t)
-
-	return ctx, cancel, ts
+}
+func subscribe(t *testing.T, s *inmem.Service, ctx context.Context, id eventstream.UserID) <-chan eventstream.Event {
+	t.Helper()
+	events, err := s.Subscribe(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+func publish(t *testing.T, s *inmem.Service, id eventstream.UserID, body string) {
+	t.Helper()
+	if err := s.Publish(context.Background(), id, testevent.New(body)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSimpleSubscription(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	defer cancel()
-	uid := eventstream.NewUserID()
-
-	events, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	bodies := defaultBodies
-	result := readNewMessageEvents(events, len(bodies))
-
-	// Action.
-	for _, b := range bodies {
-		ts.Require().NoError(ts.stream.Publish(ctx, uid, newMessageEvent(b)))
+	s := service(t)
+	id := eventstream.NewUserID()
+	events := subscribe(t, s, context.Background(), id)
+	for _, body := range []string{"Hello", "World", "!"} {
+		publish(t, s, id, body)
 	}
-
-	// Assert.
-	ts.Equal(defaultBodies, <-result)
+	for _, expected := range []string{"Hello", "World", "!"} {
+		if event := receive(t, events); event.Body != expected {
+			t.Fatal(event)
+		}
+	}
 }
 
 func TestSimpleSubscriptionNeedClose(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	uid := eventstream.NewUserID()
-
-	events, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	bodies := defaultBodies
-	result := readNewMessageEvents(events, len(bodies))
-
-	// Action.
-	for _, b := range bodies {
-		ts.Require().NoError(ts.stream.Publish(ctx, uid, newMessageEvent(b)))
+	s := service(t)
+	id := eventstream.NewUserID()
+	events := subscribe(t, s, context.Background(), id)
+	publish(t, s, id, "hello")
+	_ = receive(t, events)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
-
-	// Assert.
-	ts.Equal(defaultBodies, <-result)
-	cancel()
-	ts.Require().NoError(ts.stream.Close())
-
-	// Arrange repeat.
-	result = readNewMessageEvents(events, len(bodies))
-
-	// Action.
-	for _, b := range bodies {
-		ts.Require().NoError(ts.stream.Publish(ctx, uid, newMessageEvent(b)))
+	if _, ok := <-events; ok {
+		t.Fatal("closed service delivered an event")
 	}
-
-	// Assert.
-	ts.Nil(<-result)
-	ts.Require().NoError(ts.stream.Close())
+	if _, err := s.Subscribe(context.Background(), id); !errors.Is(err, inmem.ErrClosed) {
+		t.Fatal(err)
+	}
+	if err := s.Publish(context.Background(), id, testevent.New("after close")); !errors.Is(err, inmem.ErrClosed) {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestEventIsMultiplexedToStreams(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	defer cancel()
-	uid := eventstream.NewUserID()
-
-	tab1, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	tab2, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	tab3, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	const (
-		tabsCount        = 3
-		messagesCount    = 5
-		allMessagesCount = tabsCount * messagesCount
-	)
-
-	// Action.
-	expectedCh := make(chan []string)
-	go func() {
-		expected := make([]string, 0, allMessagesCount)
-		for i := 0; i < messagesCount; i++ {
-			v := strconv.Itoa(i)
-			err := ts.stream.Publish(ctx, uid, newMessageEvent(v))
-			ts.NoError(err)
-
-			for i := 0; i < tabsCount; i++ {
-				expected = append(expected, v)
+	s := service(t)
+	id := eventstream.NewUserID()
+	tabs := []<-chan eventstream.Event{
+		subscribe(t, s, context.Background(), id), subscribe(t, s, context.Background(), id), subscribe(t, s, context.Background(), id),
+	}
+	for i := 0; i < 5; i++ {
+		publish(t, s, id, strconv.Itoa(i))
+	}
+	for _, tab := range tabs {
+		for i := 0; i < 5; i++ {
+			if receive(t, tab).Body != strconv.Itoa(i) {
+				t.Fatal("event order")
 			}
 		}
-		expectedCh <- expected
-	}()
-
-	// Assert.
-	msgs := make([]string, 0, allMessagesCount)
-	for i := 0; i < allMessagesCount; i++ {
-		var event eventstream.Event
-		select {
-		case event = <-tab1:
-		case event = <-tab2:
-		case event = <-tab3:
-		case <-time.After(time.Second):
-			ts.FailNow("lost events")
-		}
-		msgEv, ok := event.(*testEvent)
-		ts.Require().True(ok)
-		msgs = append(msgs, msgEv.MessageBody)
 	}
-	ts.ElementsMatch(<-expectedCh, msgs)
 }
 
 func TestPublishInvalidEvent(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	defer cancel()
-	uid := eventstream.NewUserID()
-
-	events, err := ts.stream.Subscribe(ctx, uid)
-	ts.Require().NoError(err)
-
-	// Not filled event.
-	err = ts.stream.Publish(ctx, uid, &testEvent{})
-	ts.Require().Error(err)
-
-	select {
-	case ev := <-events:
-		ts.FailNow("unexpected event", ev)
-	case <-time.After(100 * time.Millisecond):
+	s := service(t)
+	id := eventstream.NewUserID()
+	for _, event := range []eventstream.Event{nil, (*testevent.Event)(nil), &testevent.Event{}} {
+		if err := s.Publish(context.Background(), id, event); !errors.Is(err, eventstream.ErrInvalidEvent) {
+			t.Fatalf("invalid event accepted: %v", err)
+		}
 	}
 }
 
 func TestPublishWithoutSubscribers(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	defer cancel()
-	ts.Run("no subscriptions at all", func() {
-		err := ts.stream.Publish(ctx, eventstream.NewUserID(), newMessageEvent("Hello"))
-		ts.Require().NoError(err)
-	})
-
-	ts.Run("publish to offline client", func() {
-		uid1, uid2 := eventstream.NewUserID(), eventstream.NewUserID()
-
-		// uid1 is online.
-		_, err := ts.stream.Subscribe(ctx, uid1)
-		ts.Require().NoError(err)
-
-		// uid2 is offline.
-		err = ts.stream.Publish(ctx, uid2, newMessageEvent("No panic"))
-		ts.Require().NoError(err)
-	})
-
-	ts.Run("client was online and became offline", func() {
-		// Arrange.
-		uid := eventstream.NewUserID()
-
-		subscribe := func(n int) (<-chan []string, context.CancelFunc) {
-			ctx, cancel := context.WithCancel(ctx)
-			// No cancel().
-
-			tab, err := ts.stream.Subscribe(ctx, uid)
-			ts.Require().NoError(err)
-
-			return readNewMessageEvents(tab, n), func() {
-				time.Sleep(10 * time.Millisecond)
-				cancel()
-			}
-		}
-
-		publish := func(v string) {
-			err := ts.stream.Publish(ctx, uid, newMessageEvent(v))
-			ts.Require().NoError(err)
-		}
-
-		// Action.
-		tab1, cancel1 := subscribe(-1)
-		publish("1")
-
-		tab2, cancel2 := subscribe(-1)
-		publish("2")
-
-		tab3, cancel3 := subscribe(-1)
-		publish("3")
-
-		cancel3()
-		publish("4")
-
-		cancel2()
-		publish("5")
-
-		cancel1()
-		publish("6")
-
-		// Assert.
-		ts.Equal([]string{"1", "2", "3", "4", "5"}, <-tab1)
-		ts.Equal([]string{"2", "3", "4"}, <-tab2)
-		ts.Equal([]string{"3"}, <-tab3)
-	})
+	s := service(t)
+	id := eventstream.NewUserID()
+	publish(t, s, id, "offline")
+	ctx, cancel := context.WithCancel(context.Background())
+	events := subscribe(t, s, ctx, id)
+	cancel()
+	for range events {
+	}
+	publish(t, s, id, "offline again")
+	if stats := s.Stats(); stats.Users != 0 || stats.Subscribers != 0 {
+		t.Fatal(stats)
+	}
 }
 
 func TestPublishInDifferentUserStreams(t *testing.T) {
-	// Arrange.
-	ctx, cancel, ts := newTestRepoSuite(t)
-	defer cancel()
-	// Arrange.
-	const users = 3
-	const messagesPerUser = 10
-
-	uids := make([]eventstream.UserID, 0, users)
-	msgChannels := make([]<-chan []string, 0, users)
-
-	for i := 0; i < users; i++ {
-		uid := eventstream.NewUserID()
-
-		events, err := ts.stream.Subscribe(ctx, uid)
-		ts.Require().NoError(err)
-
-		uids = append(uids, uid)
-		msgChannels = append(msgChannels, readNewMessageEvents(events, messagesPerUser))
+	s := service(t)
+	ids := []eventstream.UserID{eventstream.NewUserID(), eventstream.NewUserID(), eventstream.NewUserID()}
+	tabs := make([]<-chan eventstream.Event, len(ids))
+	for i, id := range ids {
+		tabs[i] = subscribe(t, s, context.Background(), id)
 	}
-
-	// Action.
-	expectedMsgs := make([][]string, users)
-	for i := 0; i < users; i++ {
-		expectedMsgs[i] = make([]string, 0, messagesPerUser)
+	for i, id := range ids {
+		publish(t, s, id, strconv.Itoa(i))
 	}
-
-	for i := 0; i < messagesPerUser; i++ {
-		for j := 0; j < users; j++ {
-			uid := uids[j]
-			v := strconv.Itoa(i*users + j)
-
-			err := ts.stream.Publish(ctx, uid, newMessageEvent(v))
-			ts.Require().NoError(err)
-
-			expectedMsgs[j] = append(expectedMsgs[j], v)
+	for i, tab := range tabs {
+		if receive(t, tab).Body != strconv.Itoa(i) {
+			t.Fatal("cross-user delivery")
 		}
 	}
-
-	// Assert.
-	receivedMsgs := make([][]string, 0, users)
-	for _, ch := range msgChannels {
-		receivedMsgs = append(receivedMsgs, <-ch)
-	}
-
-	ts.T().Log("received events", receivedMsgs)
-	ts.Equal(expectedMsgs, receivedMsgs)
 }
 
-// readNewMessageEvents reads n events from the stream.
-// If n is negative, then the function reads the stream until it is closed.
-func readNewMessageEvents(stream <-chan eventstream.Event, n int) <-chan []string {
-	result := make(chan []string)
-	var msgs []string // No preallocation, n can be negative.
-	go func() {
-		for ev := range stream {
-			msgEv, ok := ev.(*testEvent)
-			if !ok {
-				continue
-			}
-			msg := msgEv.MessageBody
-			msgs = append(msgs, msg)
-			if n != -1 && len(msgs) == n {
-				break
+func TestChurnReleasesRegistry(t *testing.T) {
+	s := service(t)
+	for i := 0; i < 500; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		events := subscribe(t, s, ctx, eventstream.NewUserID())
+		cancel()
+		for range events {
+		}
+	}
+	if stats := s.Stats(); stats.Users != 0 || stats.Subscribers != 0 || stats.QueuedBytes != 0 {
+		t.Fatal(stats)
+	}
+}
+
+func TestSlowConsumerDoesNotBlockHealthySubscriber(t *testing.T) {
+	cfg := inmem.DefaultConfig()
+	cfg.QueueCapacity = 1
+	s, err := inmem.NewWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	id := eventstream.NewUserID()
+	slow := subscribe(t, s, context.Background(), id)
+	healthy := subscribe(t, s, context.Background(), id)
+	evicted := false
+	for i := 0; i < 4; i++ {
+		err := s.Publish(context.Background(), id, testevent.New(strconv.Itoa(i)))
+		if errors.Is(err, inmem.ErrSlowConsumer) {
+			evicted = true
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if receive(t, healthy).Body != strconv.Itoa(i) {
+			t.Fatal("healthy subscriber lost event")
+		}
+	}
+	if !evicted {
+		t.Fatal("unbounded slow subscriber")
+	}
+	select {
+	case _, ok := <-slow:
+		if ok {
+			for range slow {
 			}
 		}
-		result <- msgs
-	}()
-	return result
-}
-
-type testEvent struct {
-	ID          eventstream.EventID `validate:"required"`
-	MessageBody string              `validate:"required,max=3000"`
-	CreatedAt   time.Time           `validate:"required"`
-}
-
-func (t *testEvent) EventID() eventstream.EventID {
-	return t.ID
-}
-
-func (t *testEvent) EventName() string {
-	return "testEvent"
-}
-
-func (t *testEvent) Validate() error {
-	if t.ID.IsZero() {
-		return errors.New("id is required")
+	case <-time.After(time.Second):
+		t.Fatal("slow subscriber not terminated")
 	}
-	if t.MessageBody == "" {
-		return errors.New("message body is required")
+	if stats := s.Stats(); stats.Subscribers != 1 || stats.Evicted != 1 {
+		t.Fatal(stats)
 	}
-	return nil
 }
 
-func newMessageEvent(body string) eventstream.Event {
-	return &testEvent{
-		ID:          eventstream.NewEventID(),
-		MessageBody: body,
-		CreatedAt:   time.Now(),
+func TestPublishOwnsSnapshot(t *testing.T) {
+	s := service(t)
+	id := eventstream.NewUserID()
+	first := subscribe(t, s, context.Background(), id)
+	second := subscribe(t, s, context.Background(), id)
+	input := testevent.New("original")
+	if err := s.Publish(context.Background(), id, input); err != nil {
+		t.Fatal(err)
+	}
+	input.Body = "caller changed"
+	one := receive(t, first)
+	one.Body = "consumer changed"
+	if two := receive(t, second); two.Body != "original" {
+		t.Fatal("shared mutable payload", two)
+	}
+}
+
+func TestConcurrentSubscribeShutdown(t *testing.T) {
+	for iteration := 0; iteration < 20; iteration++ {
+		s := service(t)
+		var wg sync.WaitGroup
+		wg.Add(8)
+		for i := 0; i < 8; i++ {
+			go func() {
+				defer wg.Done()
+				events, err := s.Subscribe(context.Background(), eventstream.NewUserID())
+				if err == nil {
+					for range events {
+					}
+				}
+			}()
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		if s.Stats().Subscribers != 0 {
+			t.Fatal("subscriber survived shutdown")
+		}
+	}
+}
+
+func BenchmarkPublishAndReceive(b *testing.B) {
+	s := inmem.New()
+	defer s.Close()
+	id := eventstream.NewUserID()
+	events, err := s.Subscribe(context.Background(), id)
+	if err != nil {
+		b.Fatal(err)
+	}
+	event := testevent.New("small notification")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := s.Publish(context.Background(), id, event); err != nil {
+			b.Fatal(err)
+		}
+		<-events
 	}
 }

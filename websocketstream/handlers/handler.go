@@ -1,430 +1,383 @@
+// Package handlers integrates bounded realtime delivery with Fiber v3.
 package handlers
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"reflect"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	logger "github.com/assurrussa/gologger"
 	libwebsocket "github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v3"
-	"github.com/gofiber/utils/v2"
-	"github.com/google/uuid"
-	"golang.org/x/sync/errgroup"
 
-	eventstream "github.com/assurrussa/gowebsocket/eventstream"
-	websocketstream "github.com/assurrussa/gowebsocket/websocketstream"
-	eventadapter "github.com/assurrussa/gowebsocket/websocketstream/eventadapter"
-	eventprocessor "github.com/assurrussa/gowebsocket/websocketstream/eventprocessor"
+	"github.com/assurrussa/gowebsocket/eventstream"
+	"github.com/assurrussa/gowebsocket/internal/safety"
+	"github.com/assurrussa/gowebsocket/internal/wire"
+	"github.com/assurrussa/gowebsocket/websocketstream"
+	"github.com/assurrussa/gowebsocket/websocketstream/eventadapter"
+	"github.com/assurrussa/gowebsocket/websocketstream/eventprocessor"
 )
 
-const (
-	writeTimeout = time.Second
+var (
+	errPolicy      = errors.New("invalid client event")
+	errUnsupported = errors.New("only text WebSocket messages are supported")
 )
-
-var decoding = base64.StdEncoding
-
-type eventStream interface {
-	Subscribe(ctx context.Context, userID eventstream.UserID) (<-chan eventstream.Event, error)
-}
-
-//go:generate options-gen -out-filename=handler_options.gen.go -from-struct=Options
-type Options struct {
-	pingPeriod time.Duration `default:"10s" validate:"omitempty,min=100ms,max=30s"`
-
-	logger             logger.Logger            `option:"mandatory" validate:"required"`
-	eventStream        eventStream              `option:"mandatory" validate:"required"`
-	upgrader           websocketstream.Upgrader `option:"mandatory" validate:"required"`
-	shutdownCh         <-chan struct{}          `option:"mandatory" validate:"required"`
-	userIDCtxKey       string                   `option:"mandatory" validate:"required"`
-	eventProcessors    map[string]eventprocessor.EventProcessor
-	eventAdapters      map[string]eventadapter.EventAdapter
-	readEventProcessor websocketstream.ReadEventProcessor
-	eventWriter        websocketstream.EventWriter
-	eventAdapter       websocketstream.EventAdapter
-}
 
 type HTTPHandler struct {
 	Options
-	pingPeriod time.Duration
-	pongWait   time.Duration
+	ownedProcessor                                                                     *eventprocessor.Processor
+	mu                                                                                 sync.Mutex
+	active                                                                             map[*connection]struct{}
+	closed                                                                             bool
+	wg                                                                                 sync.WaitGroup
+	stop, done                                                                         chan struct{}
+	watchOnce                                                                          sync.Once
+	accepted, rejected, incoming, outgoing, normalClosed, policyClosed, internalClosed atomic.Uint64
 }
 
-// NewHTTPHandler creates a new WebSocket handler with FastHTTP optimization.
 func NewHTTPHandler(opts Options) (*HTTPHandler, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, fmt.Errorf("validate options: %w", err)
 	}
-	opts.logger = opts.logger.WithNamed("websocket")
-
-	if opts.readEventProcessor == nil {
-		p, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(
-			opts.logger,
-			eventprocessor.WithProcessors(opts.eventProcessors),
-			eventprocessor.WithMaxTimeWait(writeTimeout),
-		))
-		if err != nil {
-			return nil, fmt.Errorf("create event processor: %w", err)
-		}
-
-		opts.readEventProcessor = p
+	if opts.pongTimeout == 0 {
+		opts.pongTimeout = opts.pingPeriod * 3
 	}
-
+	// Validate all callback registrations before starting owned workers.
+	if opts.eventAdapter == nil {
+		adapter, err := eventadapter.NewAdapter(eventadapter.NewOptions(eventadapter.WithProcessors(opts.eventAdapters)))
+		if err != nil {
+			return nil, err
+		}
+		opts.eventAdapter = adapter
+	}
 	if opts.eventWriter == nil {
 		opts.eventWriter = websocketstream.JSONEventWriter{}
 	}
-
-	if opts.eventAdapter == nil {
-		eventAdapter, err := eventadapter.NewAdapter(eventadapter.NewOptions(eventadapter.WithProcessors(opts.eventAdapters)))
+	var owned *eventprocessor.Processor
+	if opts.readEventProcessor == nil {
+		processor, err := eventprocessor.NewProcessor(eventprocessor.NewOptions(opts.logger,
+			eventprocessor.WithProcessors(opts.eventProcessors), eventprocessor.WithMaxTimeWait(opts.processTimeout),
+			eventprocessor.WithMaxEventBytes(int(opts.maxDecodedBytes)),
+			eventprocessor.WithQueueLimits(128, max(2<<20, int(opts.maxDecodedBytes)*4))))
 		if err != nil {
-			return nil, fmt.Errorf("create event adapter: %w", err)
+			return nil, err
 		}
-		opts.eventAdapter = eventAdapter
+		owned, opts.readEventProcessor = processor, processor
 	}
-
-	return &HTTPHandler{
-		Options:    opts,
-		pingPeriod: opts.pingPeriod,
-		pongWait:   pongWait(opts.pingPeriod),
-	}, nil
+	return &HTTPHandler{Options: opts, ownedProcessor: owned, active: make(map[*connection]struct{}),
+		stop: make(chan struct{}), done: make(chan struct{})}, nil
 }
 
+// Serve authenticates before upgrading. It retains only the resolved immutable
+// UserID, not Fiber's pooled request context or borrowed metadata.
 func (h *HTTPHandler) Serve(c fiber.Ctx) error {
-	conn := acquireConn()
-	// locals
-	c.Request().VisitUserValues(func(key []byte, value any) {
-		conn.locals[string(key)] = value
-	})
-	// params
-	params := c.Route().Params
-	for i := 0; i < len(params); i++ {
-		conn.params[utils.CopyString(params[i])] = utils.CopyString(c.Params(params[i]))
-	}
-	// queries
-	conn.queries = c.Queries()
-	// cookies
-	for key, value := range c.Request().Header.Cookies() {
-		conn.cookies[string(key)] = string(value)
-	}
-	// headers
-	conn.headers = c.GetReqHeaders()
-	// ip address
-	conn.ip = c.IP()
-
-	if err := h.upgrader.UpgradeFastHTTP(c.RequestCtx(), func(ws *libwebsocket.Conn) {
-		conn.Conn = ws
-		defer releaseConn(conn)
-		h.handleWebSocketConnection(conn)
-	}); err != nil {
-		h.logger.WarnContext(context.Background(), "failed to upgrade websocket connection", logger.Error(err))
-		// Upgrading required
-		return fiber.ErrUpgradeRequired
-	}
-
-	return nil
-}
-
-// handleWebSocketConnection handles the WebSocket connection logic.
-func (h *HTTPHandler) handleWebSocketConnection(ws *Conn) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	wsCloser := newWsCloser(h.logger, ws)
-	uid, ok := h.getUserID(ws)
-	if !ok {
-		h.logger.ErrorContext(ctx, "failed to find user id")
-		wsCloser.Close(ctx, libwebsocket.CloseInternalServerErr)
-		return
-	}
-
-	events, err := h.eventStream.Subscribe(ctx, uid)
-	if err != nil {
-		h.logger.ErrorContext(ctx, "cannot subscribe for events", logger.Error(err))
-		wsCloser.Close(ctx, libwebsocket.CloseInternalServerErr)
-		return
-	}
-
-	eg, ctx := errgroup.WithContext(ctx)
-
-	eg.Go(func() error {
-		return h.writeLoop(ctx, ws, events)
-	})
-
-	eg.Go(func() error {
-		return h.readLoop(ctx, ws)
-	})
-
-	eg.Go(func() error {
-		select {
-		case <-ctx.Done():
-		case <-h.shutdownCh:
-			wsCloser.Close(ctx, libwebsocket.CloseNormalClosure)
+	var uid eventstream.UserID
+	err := safety.Call(func() error {
+		if h.userIDExtractor != nil {
+			var err error
+			uid, err = h.userIDExtractor(c)
+			return err
+		}
+		value := &Conn{locals: map[string]any{h.userIDCtxKey: c.Locals(h.userIDCtxKey)}}
+		var ok bool
+		uid, ok = h.getUserID(value)
+		if !ok {
+			return fiber.ErrUnauthorized
 		}
 		return nil
 	})
-
-	if err := eg.Wait(); err != nil {
-		if !errors.Is(err, libwebsocket.ErrCloseSent) {
-			h.logger.ErrorContext(ctx, "unexpected error", logger.Error(err))
-			wsCloser.Close(ctx, libwebsocket.CloseInternalServerErr)
-		}
-		return
+	if err != nil || uid.IsZero() {
+		h.rejected.Add(1)
+		return fiber.ErrUnauthorized
 	}
-
-	wsCloser.Close(ctx, libwebsocket.CloseNormalClosure)
+	h.watchOnce.Do(func() {
+		if h.shutdownCh != nil {
+			go func() {
+				select {
+				case <-h.stop:
+					return
+				case <-h.shutdownCh:
+					_ = h.Shutdown(context.Background())
+				}
+			}()
+		}
+	})
+	ctx, cancel := context.WithCancel(eventstream.WithUserID(context.Background(), uid))
+	state := &connection{handler: h, ctx: ctx, cancel: cancel}
+	h.mu.Lock()
+	if h.closed || len(h.active) >= h.maxConnections {
+		h.mu.Unlock()
+		cancel()
+		h.rejected.Add(1)
+		return fiber.ErrServiceUnavailable
+	}
+	h.active[state] = struct{}{}
+	h.wg.Add(1)
+	h.mu.Unlock()
+	// A failed HTTP response may never invoke the hijack callback. Bound that
+	// pending handoff as well; a late callback only closes its socket.
+	state.mu.Lock()
+	if state.finished || state.ctx.Err() != nil {
+		state.mu.Unlock()
+		state.finish()
+		return fiber.ErrServiceUnavailable
+	}
+	state.timer = time.AfterFunc(h.handoffTimeout, state.expirePending)
+	state.mu.Unlock()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			state.finish()
+		}
+	}()
+	err = safety.Call(func() error {
+		return h.upgrader.UpgradeFastHTTP(c.RequestCtx(), func(ws *libwebsocket.Conn) {
+			if !state.attach(ws) {
+				_ = ws.Close()
+				return
+			}
+			defer state.finish()
+			defer ws.Close()
+			h.accepted.Add(1)
+			err := safety.Call(func() error { return h.serveConnection(state.ctx, ws, uid) })
+			if err != nil && closeCode(err) == libwebsocket.CloseInternalServerErr {
+				h.logger.ErrorContext(state.ctx, "websocket connection failed", "panic", errors.Is(err, safety.ErrPanic))
+			}
+		})
+	})
+	if err != nil {
+		h.rejected.Add(1)
+		var handshake libwebsocket.HandshakeError
+		if errors.As(err, &handshake) {
+			return nil
+		} // The upgrader already wrote 400/403/405.
+		return fiber.NewError(fiber.StatusInternalServerError, "websocket upgrade failed")
+	}
+	handedOff = true
+	return nil
 }
 
-// readLoop listen PONGs.
+func (h *HTTPHandler) serveConnection(ctx context.Context, ws websocketstream.Websocket, uid eventstream.UserID) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	events, err := h.eventStream.Subscribe(ctx, uid)
+	if err != nil {
+		newWsCloser(ws, h.closeTimeout).Close(context.Background(), libwebsocket.CloseInternalServerErr)
+		return err
+	}
+	if events == nil {
+		return errors.New("event stream returned a nil subscription")
+	}
+	if limiter, ok := ws.(interface{ SetReadLimit(int64) }); ok {
+		limiter.SetReadLimit(h.maxMessageBytes)
+	}
+	results := make(chan error, 2)
+	go func() { results <- safety.Call(func() error { return h.readLoop(ctx, ws) }) }()
+	go func() { results <- safety.Call(func() error { return h.writeLoop(ctx, ws, events) }) }()
+	remaining := 2
+	select {
+	case err = <-results:
+		remaining--
+	case <-ctx.Done():
+	}
+	cancel()
+	code := closeCode(err)
+	newWsCloser(ws, h.closeTimeout).Close(context.Background(), code)
+	// Close above interrupts NextReader/NextWriter before waiting for the pumps.
+	for i := 0; i < remaining; i++ {
+		<-results
+	}
+	switch code {
+	case libwebsocket.CloseNormalClosure:
+		h.normalClosed.Add(1)
+	case libwebsocket.CloseInternalServerErr:
+		h.internalClosed.Add(1)
+	default:
+		h.policyClosed.Add(1)
+	}
+	return err
+}
+
+func closeCode(err error) int {
+	switch {
+	case err == nil, errors.Is(err, context.Canceled), errors.Is(err, libwebsocket.ErrCloseSent),
+		libwebsocket.IsCloseError(err, libwebsocket.CloseNormalClosure, libwebsocket.CloseGoingAway):
+		return libwebsocket.CloseNormalClosure
+	case errors.Is(err, wire.ErrTooLarge), errors.Is(err, libwebsocket.ErrReadLimit):
+		return libwebsocket.CloseMessageTooBig
+	case errors.Is(err, eventprocessor.ErrOverloaded):
+		return libwebsocket.CloseTryAgainLater
+	case errors.Is(err, errUnsupported):
+		return libwebsocket.CloseUnsupportedData
+	case errors.Is(err, errPolicy), errors.Is(err, wire.ErrEncoding):
+		return libwebsocket.ClosePolicyViolation
+	default:
+		return libwebsocket.CloseInternalServerErr
+	}
+}
+
 func (h *HTTPHandler) readLoop(ctx context.Context, ws websocketstream.Websocket) error {
-	defer func() {
-		h.logger.DebugContext(ctx, "ws read loop finished")
-	}()
-	h.logger.DebugContext(ctx, "ws read loop started")
-
-	ws.SetPongHandler(func(string) error {
-		h.logger.DebugContext(ctx, "pong")
-		return ws.SetReadDeadline(time.Now().Add(h.pongWait))
-	})
-
-	if err := ws.SetReadDeadline(time.Now().Add(h.pongWait)); err != nil {
-		return fmt.Errorf("set first read deadline: %w", err)
+	ws.SetPongHandler(func(string) error { return ws.SetReadDeadline(time.Now().Add(h.pongTimeout)) })
+	if err := ws.SetReadDeadline(time.Now().Add(h.pongTimeout)); err != nil {
+		return err
 	}
 	for {
-		mt, r, err := ws.NextReader()
-		if libwebsocket.IsCloseError(err, libwebsocket.CloseNormalClosure) {
-			return nil
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		kind, reader, err := ws.NextReader()
 		if err != nil {
-			return fmt.Errorf("get next reader: %w", err)
+			return err
 		}
-
-		rawMessage, err := io.ReadAll(r)
+		if kind != libwebsocket.TextMessage {
+			return errUnsupported
+		}
+		message, err := wire.Decode(reader, h.wireFormat, h.maxMessageBytes, h.maxDecodedBytes)
 		if err != nil {
-			h.logger.ErrorContext(ctx, "can't read message", slog.Int("mt", mt), logger.Error(err))
-
-			continue
+			return err
 		}
-
-		message, err := decoding.DecodeString(string(rawMessage))
-		if err != nil {
-			h.logger.ErrorContext(ctx, "can't read decode", slog.Int("mt", mt), logger.Error(err))
-
-			continue
-		}
-
 		event, err := h.eventAdapter.ReverseAdapt(message)
 		if err != nil {
-			h.logger.ErrorContext(ctx, "can't read message", slog.Int("mt", mt), logger.Error(err))
-
-			continue
+			return errPolicy
 		}
-
-		h.readEventProcessor.Process(ctx, event)
+		if err := eventstream.ValidateEvent(event); err != nil {
+			return errPolicy
+		}
+		if submitter, ok := h.readEventProcessor.(websocketstream.EventSubmitter); ok {
+			if err := submitter.Submit(ctx, event); err != nil {
+				if errors.Is(err, eventprocessor.ErrOverloaded) {
+					return err
+				}
+				return errPolicy
+			}
+		} else {
+			// Compatibility processors must return promptly; prefer EventSubmitter.
+			h.readEventProcessor.Process(ctx, event)
+		}
+		h.incoming.Add(1)
 	}
 }
 
-// writeLoop listen events and writes them into Websocket.
+type limitedWriter struct {
+	writer    io.Writer
+	remaining int64
+}
+
+func (w *limitedWriter) Write(data []byte) (int, error) {
+	if int64(len(data)) > w.remaining {
+		return 0, wire.ErrTooLarge
+	}
+	n, err := w.writer.Write(data)
+	w.remaining -= int64(n)
+	if err == nil && n != len(data) {
+		return n, io.ErrShortWrite
+	}
+	return n, err
+}
+
 func (h *HTTPHandler) writeLoop(ctx context.Context, ws websocketstream.Websocket, events <-chan eventstream.Event) error {
-	defer func() {
-		h.logger.DebugContext(ctx, "ws write loop finished")
-	}()
-	h.logger.DebugContext(ctx, "ws write loop started")
-
-	pingTicker := time.NewTicker(h.pingPeriod)
-	defer pingTicker.Stop()
-
+	ticker := time.NewTicker(h.pingPeriod)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-
-		case <-pingTicker.C:
-			if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-				return fmt.Errorf("set write deadline: %w", err)
+			return ctx.Err()
+		case <-ticker.C:
+			if err := ws.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
+				return err
 			}
 			if err := ws.WriteMessage(libwebsocket.PingMessage, nil); err != nil {
-				return fmt.Errorf("write ping message: %w", err)
+				return err
 			}
-			h.logger.DebugContext(ctx, "ping")
-
 		case event, ok := <-events:
 			if !ok {
-				return errors.New("events stream was closed")
+				return eventprocessor.ErrOverloaded
+			} // Resync after terminated delivery.
+			if err := eventstream.ValidateEvent(event); err != nil {
+				return err
 			}
-
-			if !ok {
-				return nil
-			}
-
 			adapted, err := h.eventAdapter.Adapt(event)
 			if err != nil {
-				h.logger.ErrorContext(ctx, "cannot adapt event to out stream", logger.Error(err))
-				continue
+				return err
 			}
-
-			if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-				return fmt.Errorf("set write deadline: %w", err)
+			if err := ws.SetWriteDeadline(time.Now().Add(h.writeTimeout)); err != nil {
+				return err
 			}
-
-			wr, err := ws.NextWriter(libwebsocket.TextMessage)
+			writer, err := ws.NextWriter(libwebsocket.TextMessage)
 			if err != nil {
-				return fmt.Errorf("get next writer: %w", err)
+				return err
 			}
-
-			if err := h.eventWriter.Write(adapted, wr); err != nil {
-				return fmt.Errorf("write data to connection: %w", err)
+			err = safety.Call(func() error {
+				return h.eventWriter.Write(adapted, &limitedWriter{writer: writer, remaining: h.maxOutboundBytes})
+			})
+			if err != nil {
+				// Do not flush a partial application message as valid JSON.
+				_ = ws.Close()
+				_ = writer.Close()
+				return err
 			}
-
-			if err := wr.Close(); err != nil {
-				return fmt.Errorf("flush writer: %w", err)
+			if err := writer.Close(); err != nil {
+				return err
 			}
+			h.outgoing.Add(1)
 		}
 	}
 }
 
-// getUserID retrieves the user ID from the fiber context.
-
-// userWithEventstreamUUID defines an interface for structs returning eventstream.UserID.
-type userWithEventstreamUUID interface {
-	GetUUID() eventstream.UserID
-}
-
-// userWithUUIDUUID defines an interface for structs returning uuid.UUID.
-type userWithUUIDUUID interface {
-	GetUUID() uuid.UUID
-}
-
-// userWithStringUUID defines an interface for structs returning string.
-type userWithStringUUID interface {
-	GetUUID() string
-}
-
-func isNil(v any) bool {
-	if v == nil {
-		return true
+// Shutdown closes active sockets, cancels their contexts and drains the owned
+// default processor. Injected processors/streams/loggers remain caller-owned.
+func (h *HTTPHandler) Shutdown(ctx context.Context) error {
+	h.mu.Lock()
+	if !h.closed {
+		h.closed = true
+		close(h.stop)
+		states := make([]*connection, 0, len(h.active))
+		for state := range h.active {
+			states = append(states, state)
+		}
+		go func() {
+			for _, state := range states {
+				state.stop()
+			}
+			h.wg.Wait()
+			if h.ownedProcessor != nil {
+				h.ownedProcessor.Close()
+			}
+			close(h.done)
+		}()
 	}
-
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
-		return rv.IsNil()
+	h.mu.Unlock()
+	select {
+	case <-h.done:
+		return nil
 	default:
-		return false
 	}
-}
-
-func toUserID(v any) (eventstream.UserID, bool) {
-	if isNil(v) {
-		return eventstream.UserIDNil, false
-	}
-
-	switch id := v.(type) {
-	case eventstream.UserID:
-		return id, !id.IsZero()
-	case uuid.UUID:
-		u := eventstream.UserID(id)
-		return u, !u.IsZero()
-	case [16]byte:
-		u := eventstream.UserID(id)
-		return u, !u.IsZero()
-	case string:
-		u, err := eventstream.ParseUserID(id)
-		if err != nil {
-			return eventstream.UserIDNil, false
+	select {
+	case <-h.done:
+		return nil
+	case <-ctx.Done():
+		if h.ownedProcessor != nil {
+			_ = h.ownedProcessor.Shutdown(ctx)
 		}
-		return u, !u.IsZero()
-	case fmt.Stringer:
-		u, err := eventstream.ParseUserID(id.String())
-		if err != nil {
-			return eventstream.UserIDNil, false
-		}
-		return u, !u.IsZero()
-	default:
-		return eventstream.UserIDNil, false
+		return ctx.Err()
 	}
 }
 
-func (h *HTTPHandler) getUserID(ctx *Conn) (eventstream.UserID, bool) {
-	val := ctx.Locals(h.userIDCtxKey)
-	if isNil(val) {
-		return eventstream.UserIDNil, false
-	}
+func (h *HTTPHandler) Close() error { return h.Shutdown(context.Background()) }
 
-	switch id := val.(type) {
-	case eventstream.UserID:
-		return id, !id.IsZero()
-	case uuid.UUID:
-		u := eventstream.UserID(id)
-		return u, !u.IsZero()
-	case [16]byte:
-		u := eventstream.UserID(id)
-		return u, !u.IsZero()
-	}
-
-	if user, ok := val.(userWithEventstreamUUID); ok {
-		u := user.GetUUID()
-		return u, !u.IsZero()
-	}
-
-	if user, ok := val.(userWithUUIDUUID); ok {
-		u := eventstream.UserID(user.GetUUID())
-		return u, !u.IsZero()
-	}
-
-	if user, ok := val.(userWithStringUUID); ok {
-		u, err := eventstream.ParseUserID(user.GetUUID())
-		if err != nil || u.IsZero() {
-			return eventstream.UserIDNil, false
-		}
-		return u, true
-	}
-
-	if u, ok, hasMethod := getUserIDByReflection(val); hasMethod {
-		return u, ok
-	}
-
-	return toUserID(val)
+type Stats struct {
+	Active                                                                             int
+	Accepted, Rejected, Incoming, Outgoing, NormalClosed, PolicyClosed, InternalClosed uint64
 }
 
-func getUserIDByReflection(val any) (id eventstream.UserID, ok bool, hasMethod bool) {
-	if isNil(val) {
-		return eventstream.UserIDNil, false, false
-	}
-
-	rv := reflect.ValueOf(val)
-	if !rv.IsValid() {
-		return eventstream.UserIDNil, false, false
-	}
-
-	method := rv.MethodByName("GetUUID")
-	if !method.IsValid() && rv.Kind() == reflect.Struct {
-		ptr := reflect.New(rv.Type())
-		ptr.Elem().Set(rv)
-		method = ptr.MethodByName("GetUUID")
-	}
-
-	if !method.IsValid() {
-		return eventstream.UserIDNil, false, false
-	}
-
-	if method.Type().NumIn() != 0 || method.Type().NumOut() != 1 {
-		return eventstream.UserIDNil, false, true
-	}
-
-	res := method.Call(nil)
-	if len(res) != 1 {
-		return eventstream.UserIDNil, false, true
-	}
-
-	u, ok := toUserID(res[0].Interface())
-	return u, ok, true
-}
-
-func pongWait(ping time.Duration) time.Duration {
-	return ping * 3 / 2
+func (h *HTTPHandler) Stats() Stats {
+	h.mu.Lock()
+	active := len(h.active)
+	h.mu.Unlock()
+	return Stats{Active: active, Accepted: h.accepted.Load(), Rejected: h.rejected.Load(),
+		Incoming: h.incoming.Load(), Outgoing: h.outgoing.Load(), NormalClosed: h.normalClosed.Load(),
+		PolicyClosed: h.policyClosed.Load(), InternalClosed: h.internalClosed.Load()}
 }

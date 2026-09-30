@@ -1,47 +1,61 @@
+// Package websocketstream defines realtime transport contracts.
 package websocketstream
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 
-	"github.com/goccy/go-json"
-
-	eventstream "github.com/assurrussa/gowebsocket/eventstream"
+	"github.com/assurrussa/gowebsocket/eventstream"
 )
 
-// EventAdapter converts the event from the stream to the appropriate object.
 type EventAdapter interface {
-	Adapt(event eventstream.Event) (any, error)
-	ReverseAdapt(message []byte) (eventstream.Event, error)
+	Adapt(eventstream.Event) (any, error)
+	ReverseAdapt([]byte) (eventstream.Event, error)
 }
 
-// ReadEventProcessor process read event new message from client.
 type ReadEventProcessor interface {
-	Process(ctx context.Context, event eventstream.Event)
+	Process(context.Context, eventstream.Event)
 }
 
-// EventWriter write adapted event it to the socket.
-type EventWriter interface {
-	Write(event any, out io.Writer) error
+// EventSubmitter allows HTTPHandler to observe overload without blocking reads.
+type EventSubmitter interface {
+	Submit(context.Context, eventstream.Event) error
 }
 
+type EventWriter interface{ Write(any, io.Writer) error }
+
+// JSONEventWriter preserves the legacy raw []byte/string API, but validates the
+// JSON before writing. Prefer RawMessage or structured values in new code.
 type JSONEventWriter struct{}
 
 func (JSONEventWriter) Write(event any, out io.Writer) error {
+	var raw []byte
 	switch data := event.(type) {
+	case json.RawMessage:
+		raw = data
 	case []byte:
-		if _, err := out.Write(data); err != nil {
-			return err
-		}
-
-		return nil
+		raw = data
 	case string:
-		if _, err := out.Write([]byte(data)); err != nil {
-			return err
-		}
-
-		return nil
+		raw = []byte(data)
+	default:
+		return json.NewEncoder(out).Encode(event)
 	}
+	if !json.Valid(raw) {
+		return errors.New("invalid raw JSON event")
+	}
+	n, err := out.Write(raw)
+	if err == nil && n != len(raw) {
+		return io.ErrShortWrite
+	}
+	return err
+}
 
+// StrictJSONEventWriter uses standard encoding/json semantics: strings become
+// JSON strings and []byte becomes base64. RawMessage is the explicit raw escape.
+type StrictJSONEventWriter struct{}
+
+func (StrictJSONEventWriter) Write(event any, out io.Writer) error {
 	return json.NewEncoder(out).Encode(event)
 }

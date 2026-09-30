@@ -1,0 +1,63 @@
+name: checks
+on:
+  push:
+    branches: [master, fix/review-hardening]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.27.0', '1.27.1']
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Toolchain
+        env:
+          GOTOOLCHAIN: local
+        run: go version
+      - name: Dependencies
+        env:
+          GOTOOLCHAIN: local
+        run: go mod download
+      - name: Format, vet, tests and examples
+        env:
+          GOTOOLCHAIN: local
+        run: make fmt-check vet test examples
+      - name: Race regressions
+        env:
+          GOTOOLCHAIN: local
+        run: make test-race
+      - name: Benchmarks (informational timings)
+        env:
+          GOTOOLCHAIN: local
+        run: make bench-all
+      - name: Clean consumer
+        env:
+          GOTOOLCHAIN: local
+        run: make consumer
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.27.1'
+          cache: true
+      - run: make lint

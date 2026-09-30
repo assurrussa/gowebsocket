@@ -5,42 +5,32 @@ import (
 	"sync"
 	"time"
 
-	logger "github.com/assurrussa/gologger"
 	libwebsocket "github.com/fasthttp/websocket"
 
-	websocketstream "github.com/assurrussa/gowebsocket/websocketstream"
-)
-
-const (
-	closeDeadline = 5 * time.Second
-	graceTimeout  = 1 * time.Second
+	"github.com/assurrussa/gowebsocket/websocketstream"
 )
 
 type wsCloser struct {
-	once   sync.Once
-	logger logger.Logger
-	ws     websocketstream.Websocket
+	once    sync.Once
+	ws      websocketstream.Websocket
+	timeout time.Duration
 }
 
-func newWsCloser(logger logger.Logger, ws websocketstream.Websocket) *wsCloser {
-	return &wsCloser{
-		ws:     ws,
-		logger: logger,
-		once:   sync.Once{},
-	}
+func newWsCloser(ws websocketstream.Websocket, timeout time.Duration) *wsCloser {
+	return &wsCloser{ws: ws, timeout: timeout}
 }
 
+// Close sends one bounded close control frame, then interrupts I/O immediately.
+// It does not sleep and does not promise a complete peer close handshake.
 func (c *wsCloser) Close(ctx context.Context, code int) {
 	c.once.Do(func() {
-		c.logger.DebugContext(ctx, "close connection")
-
-		_ = c.ws.WriteControl(
-			libwebsocket.CloseMessage,
-			libwebsocket.FormatCloseMessage(code, ""),
-			time.Now().Add(closeDeadline),
-		)
-
-		time.Sleep(graceTimeout)
-		_ = c.ws.Close()
+		defer c.ws.Close()
+		deadline := time.Now().Add(c.timeout)
+		if limit, ok := ctx.Deadline(); ok && limit.Before(deadline) {
+			deadline = limit
+		}
+		if ctx.Err() == nil {
+			_ = c.ws.WriteControl(libwebsocket.CloseMessage, libwebsocket.FormatCloseMessage(code, ""), deadline)
+		}
 	})
 }
