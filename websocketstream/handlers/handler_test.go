@@ -31,7 +31,7 @@ func TestHTTPHandler(t *testing.T) {
 
 		pingInterval = eventInterval / 4
 
-		origin = "http://localhost"
+		origin = testOrigin
 
 		headerSecWsProtocol = "Sec-WebSocket-Protocol"
 		secWsProtocol       = "chat-service-protocol.test"
@@ -60,6 +60,7 @@ func TestHTTPHandler(t *testing.T) {
 		handlers2.WithEventAdapter(eventAdapter{}),
 	))
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, h.Close()) })
 
 	// Создаем Fiber приложение для тестирования
 	app := fiber.New()
@@ -204,6 +205,7 @@ func TestWebSocketUpgrade(t *testing.T) {
 	require.NoError(t, err)
 
 	// Тестируем только создание хэндлера
+	t.Cleanup(func() { require.NoError(t, h.Close()) })
 	assert.NotNil(t, h)
 	t.Log("WebSocket handler created successfully")
 }
@@ -286,7 +288,6 @@ func (s customSessionWithEventstreamUserID) GetUUID() eventstream.UserID {
 }
 
 func TestGetUserIDVariations(t *testing.T) {
-	origin := "http://localhost"
 	log := logger.Default().WithNamed("TestGetUserIDVariations")
 	uid := eventstream.NewUserID()
 	rawUUID := uuid.UUID(uid)
@@ -435,7 +436,7 @@ func TestGetUserIDVariations(t *testing.T) {
 			h, err := handlers2.NewHTTPHandler(handlers2.NewOptions(
 				log,
 				mockES,
-				websocketstream.NewUpgrader([]string{origin}, []string{}),
+				websocketstream.NewUpgrader([]string{testOrigin}, []string{}),
 				shutdownCh,
 				"user_key",
 				handlers2.WithPingPeriod(time.Second),
@@ -443,6 +444,7 @@ func TestGetUserIDVariations(t *testing.T) {
 				handlers2.WithEventAdapter(eventAdapter{}),
 			))
 			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, h.Close()) })
 
 			app := fiber.New()
 			app.Get("/ws", func(c fiber.Ctx) error {
@@ -472,7 +474,7 @@ func TestGetUserIDVariations(t *testing.T) {
 			}
 
 			header := http.Header{}
-			header.Add("Origin", origin)
+			header.Add(originHeader, testOrigin)
 			c, resp, dialErr := dialer.DialContext(ctx, "ws://localhost/ws", header)
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
