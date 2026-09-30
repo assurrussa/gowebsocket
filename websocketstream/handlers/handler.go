@@ -291,7 +291,8 @@ func (h *HTTPHandler) readLoop(ctx context.Context, ws websocketstream.Websocket
 		}
 		if submitter, ok := h.readEventProcessor.(websocketstream.EventSubmitter); ok {
 			if err := submitter.Submit(ctx, event); err != nil {
-				if errors.Is(err, eventprocessor.ErrOverloaded) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+					errors.Is(err, eventprocessor.ErrOverloaded) {
 					return err
 				}
 				return errPolicy

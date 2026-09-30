@@ -529,6 +529,58 @@ func TestProcessorOverloadClosesWithRetryCode(t *testing.T) {
 	}
 }
 
+type failingSubmitter struct{ err error }
+
+func (failingSubmitter) Process(context.Context, eventstream.Event) { panic("Submit must be used") }
+
+func (p failingSubmitter) Submit(context.Context, eventstream.Event) error { return p.err }
+
+func TestProcessorCancellationIsNotPolicyViolation(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{name: "canceled", err: context.Canceled, code: libwebsocket.CloseNormalClosure},
+		{name: "wrapped canceled", err: fmt.Errorf("submit: %w", context.Canceled), code: libwebsocket.CloseNormalClosure},
+		{name: "deadline", err: context.DeadlineExceeded, code: libwebsocket.CloseInternalServerErr},
+		{
+			name: "wrapped deadline", err: fmt.Errorf("submit: %w", context.DeadlineExceeded),
+			code: libwebsocket.CloseInternalServerErr,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON),
+				handlers.WithReadEventProcessor(failingSubmitter{err: tc.err}))
+			conn := s.dial(t)
+			// Keep the connection context live so the pump result determines the close.
+			if err := conn.WriteJSON(testevent.New("submission canceled")); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := conn.ReadMessage()
+			if !libwebsocket.IsCloseError(err, tc.code) {
+				t.Fatalf("submission cancellation closed with the wrong code: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := s.h.Shutdown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			stats := s.h.Stats()
+			if stats.PolicyClosed != 0 || stats.Incoming != 0 {
+				t.Fatal("canceled submission counted as a policy violation or accepted message", stats)
+			}
+			if tc.code == libwebsocket.CloseNormalClosure && stats.NormalClosed != 1 {
+				t.Fatal("cancellation was not counted as a normal close", stats)
+			}
+			if tc.code == libwebsocket.CloseInternalServerErr && stats.InternalClosed != 1 {
+				t.Fatal("deadline was not counted as an internal close", stats)
+			}
+		})
+	}
+}
+
 func TestOutboundLimitRejectsWithoutDeliveringPayload(t *testing.T) {
 	s := newHardeningServer(t, handlers.WithMaxOutboundBytes(64))
 	conn := s.dial(t)
