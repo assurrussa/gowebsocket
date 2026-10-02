@@ -284,24 +284,33 @@ func (h *HTTPHandler) readLoop(ctx context.Context, ws websocketstream.Websocket
 		}
 		event, err := h.eventAdapter.ReverseAdapt(message)
 		if err != nil {
-			return errPolicy
+			return incomingError(err)
 		}
 		if err := eventstream.ValidateEvent(event); err != nil {
-			return errPolicy
+			return incomingError(err)
 		}
 		if submitter, ok := h.readEventProcessor.(websocketstream.EventSubmitter); ok {
 			if err := submitter.Submit(ctx, event); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-					errors.Is(err, eventprocessor.ErrOverloaded) {
-					return err
-				}
-				return errPolicy
+				return incomingError(err)
 			}
 		} else {
 			// Compatibility processors must return promptly; prefer EventSubmitter.
 			h.readEventProcessor.Process(ctx, event)
 		}
 		h.incoming.Add(1)
+	}
+}
+
+// Preserve known infrastructure failures; validation failures remain policy
+// violations without exposing application error details to the client.
+func incomingError(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, eventprocessor.ErrOverloaded), errors.Is(err, eventprocessor.ErrClosed),
+		errors.Is(err, safety.ErrPanic):
+		return err
+	default:
+		return errPolicy
 	}
 }
 

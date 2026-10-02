@@ -90,6 +90,9 @@ func (a *Adapter) ReverseAdapt(message []byte) (event eventstream.Event, err err
 		var err error
 		event, err = processor.ReverseAdapt(message)
 		if err != nil {
+			if errors.Is(err, safety.ErrPanic) {
+				return safety.ErrPanic
+			}
 			return errors.New("invalid event payload")
 		}
 		if err := eventstream.ValidateEvent(event); err != nil {

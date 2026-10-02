@@ -30,6 +30,13 @@ that variable's parameter type.
 - Raw byte/string JSONEventWriter inputs are validated. StrictJSONEventWriter
   is additive and uses standard JSON behavior for byte slices and strings.
 
+## Unreleased error-classification correction
+
+Inbound callback panics and submissions to a closed processor now close with
+1011 (server error) and increment InternalClosed, rather than 1008 and PolicyClosed.
+Invalid client events still use 1008; overload and cancellation retain their
+existing close codes. No callback error details are sent to the client.
+
 ## Startup/shutdown order
 
 Create stream, domain handlers and HTTPHandler. Register h.Serve as the Fiber
