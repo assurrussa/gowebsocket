@@ -76,13 +76,26 @@ type upgradeResponse struct {
 func (w *upgradeResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *upgradeResponse) WriteHeader(status int) {
-	w.written = true
 	w.ResponseWriter.WriteHeader(status)
+	if status == http.StatusSwitchingProtocols || status >= http.StatusOK {
+		w.written = true
+	}
 }
 
 func (w *upgradeResponse) Write(data []byte) (int, error) {
 	w.written = true
 	return w.ResponseWriter.Write(data)
+}
+
+func (w *upgradeResponse) Flush() { _ = w.FlushError() }
+
+func (w *upgradeResponse) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		// Flushing commits the implicit status, including when the network write fails.
+		w.written = true
+	}
+	return err
 }
 
 func (w *upgradeResponse) Hijack() (net.Conn, *bufio.ReadWriter, error) {

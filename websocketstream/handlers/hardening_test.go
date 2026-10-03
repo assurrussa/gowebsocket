@@ -223,7 +223,7 @@ func TestInvalidEventIsRejectedBeforeHandler(t *testing.T) {
 		t.Helper()
 		s := newServer(t, handlers.WithWireFormat(handlers.JSON))
 		conn := s.dial(t)
-		if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(`{"eventType":testEventType}`)); err != nil {
+		if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(`{"eventType":"test"}`)); err != nil {
 			t.Fatal(err)
 		}
 		_, _, err := conn.ReadMessage()

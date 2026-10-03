@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -328,4 +329,46 @@ func TestNetHTTPLateUpgradeClosesWithoutPumps(t *testing.T) {
 			t.Fatal("late socket started pumps")
 		}
 	})
+}
+
+func TestNetHTTPInformationalAndFlushedResponses(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		name := "early hints"
+		if flush {
+			name = "flushed"
+		}
+		t.Run(name, func(t *testing.T) {
+			upgrader := &countingHTTPUpgrader{upgrade: func(w http.ResponseWriter, _ *http.Request) (websocketstream.Websocket, error) {
+				w.WriteHeader(http.StatusEarlyHints)
+				if flush {
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						return nil, err
+					}
+				}
+				return nil, errors.New("upgrade failed after interim response")
+			}}
+			s := newNetHTTPServerWithUpgrader(t, upgrader)
+			transport := &http.Transport{DialContext: s.dialer.NetDialContext}
+			defer transport.CloseIdleConnections()
+			client := &http.Client{Transport: transport, Timeout: time.Second}
+			request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://localhost/ws", nil)
+			request.RequestURI = ""
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, wantBody := http.StatusInternalServerError, "websocket upgrade failed\n"
+			if flush {
+				want, wantBody = http.StatusOK, ""
+			}
+			if response.StatusCode != want || string(body) != wantBody {
+				t.Fatalf("response after failed upgrade: status %d body %q", response.StatusCode, body)
+			}
+		})
+	}
 }
