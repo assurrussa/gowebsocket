@@ -37,10 +37,44 @@ Inbound callback panics and submissions to a closed processor now close with
 Invalid client events still use 1008; overload and cancellation retain their
 existing close codes. No callback error details are sent to the client.
 
+## Unreleased net/http adapter (additive)
+
+`*handlers.HTTPHandler` now implements `http.Handler` through
+`ServeHTTP(http.ResponseWriter, *http.Request)`. Register it with
+`mux.Handle("/ws", h)`. Existing constructors, `Serve(fiber.Ctx) error`,
+`WithUserIDExtractor` and the legacy Fiber context-key path are unchanged.
+Existing Fiber applications do not need to migrate.
+
+For net/http, configure `WithNetHTTPUserIDExtractor` with a
+`func(*http.Request) (eventstream.UserID, error)` that resolves a verified
+application identity. A net/http-only handler can pass `nil, ""` for the
+shutdown channel and legacy Fiber context key in `NewOptions`. The net/http
+adapter requires its own explicit extractor: absence, an error, a zero ID or a
+panic returns HTTP 401 before upgrade, with no Fiber or context-key fallback.
+An extractor may read trusted middleware values from the request context, but
+only the resolved immutable user ID survives into the connection context. HTTP
+request cancellation and other request values are not the socket's lifecycle;
+the handler cancels connection work on disconnect or shutdown.
+
+One handler can serve both Fiber and net/http when both identity extractors are
+configured. Both adapters use the same admission limit, connection pumps,
+wire formats, origin policy, event processors, statistics and shutdown state.
+Do not construct a second handler merely to mount another router unless
+independent connection limits and lifecycles are intended.
+
+Configure `http.Server` read-header/read/write/idle timeouts and preserve
+`http.Hijacker` in response-writer middleware. Call `h.Shutdown(ctx)` explicitly:
+`http.Server.Shutdown` does not close or wait for hijacked WebSockets. Check its
+error before treating WebSocket shutdown as complete. The complete
+[`examples/nethttp`](../examples/nethttp/main.go) demo binds to
+`http://127.0.0.1:8081` and includes session extraction, an exact Origin allowlist,
+JSON echo, HTTP timeouts and signal-driven shutdown. Its session is demo-only.
+
 ## Startup/shutdown order
 
 Create stream, domain handlers and HTTPHandler. Register h.Serve as the Fiber
-route. At shutdown stop admissions using h.Shutdown(ctx), then close the stream
+route or register h directly with a net/http mux. At shutdown stop admissions
+using h.Shutdown(ctx), then close the stream
 and caller-owned processors, then stop the HTTP listener. Reuse a deadline for
 the shutdown operation, not the already-canceled signal context.
 
