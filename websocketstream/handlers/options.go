@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"net/http"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -22,7 +23,10 @@ type eventStream interface {
 
 type (
 	UserIDExtractor func(fiber.Ctx) (eventstream.UserID, error)
-	WireFormat      = wire.Format
+	// NetHTTPUserIDExtractor resolves authenticated identity before the upgrade.
+	// It must not trust user IDs supplied by WebSocket messages.
+	NetHTTPUserIDExtractor func(*http.Request) (eventstream.UserID, error)
+	WireFormat             = wire.Format
 )
 
 const (
@@ -41,6 +45,7 @@ type Options struct {
 	shutdownCh                                                                          <-chan struct{}
 	userIDCtxKey                                                                        string
 	userIDExtractor                                                                     UserIDExtractor
+	netHTTPUserIDExtractor                                                              NetHTTPUserIDExtractor
 	eventProcessors                                                                     map[string]eventprocessor.EventProcessor
 	eventAdapters                                                                       map[string]eventadapter.EventAdapter
 	readEventProcessor                                                                  websocketstream.ReadEventProcessor
@@ -104,6 +109,12 @@ func WithUserIDExtractor(v UserIDExtractor) OptOptionsSetter {
 	return func(o *Options) { o.userIDExtractor = v }
 }
 
+// WithNetHTTPUserIDExtractor enables authenticated net/http requests. ServeHTTP
+// fails closed when no extractor is set; it never uses Fiber context locals.
+func WithNetHTTPUserIDExtractor(v NetHTTPUserIDExtractor) OptOptionsSetter {
+	return func(o *Options) { o.netHTTPUserIDExtractor = v }
+}
+
 func WithEventProcessors(v map[string]eventprocessor.EventProcessor) OptOptionsSetter {
 	return func(o *Options) { o.eventProcessors = maps.Clone(v) }
 }
@@ -141,7 +152,7 @@ func (o *Options) validateRequired() error {
 	if safety.IsNil(o.logger) || safety.IsNil(o.eventStream) || safety.IsNil(o.upgrader) {
 		return errors.New("logger, event stream and upgrader are required")
 	}
-	if o.userIDExtractor == nil && o.userIDCtxKey == "" {
+	if o.userIDExtractor == nil && o.netHTTPUserIDExtractor == nil && o.userIDCtxKey == "" {
 		return errors.New("user extractor or context key required")
 	}
 	return nil

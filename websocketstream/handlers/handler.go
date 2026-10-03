@@ -1,4 +1,4 @@
-// Package handlers integrates bounded realtime delivery with Fiber v3.
+// Package handlers integrates bounded realtime delivery with Fiber v3 and net/http.
 package handlers
 
 import (
@@ -11,7 +11,6 @@ import (
 	"time"
 
 	libwebsocket "github.com/fasthttp/websocket"
-	"github.com/gofiber/fiber/v3"
 
 	"github.com/assurrussa/gowebsocket/eventstream"
 	"github.com/assurrussa/gowebsocket/internal/safety"
@@ -85,90 +84,6 @@ func NewHTTPHandler(opts Options) (*HTTPHandler, error) {
 		}
 	}
 	return h, nil
-}
-
-// Serve authenticates before upgrading. It retains only the resolved immutable
-// UserID, not Fiber's pooled request context or borrowed metadata.
-func (h *HTTPHandler) Serve(c fiber.Ctx) error {
-	select {
-	case <-h.shutdownCh:
-		h.beginShutdown(context.Background())
-	default:
-	}
-	h.mu.Lock()
-	closed := h.closed
-	h.mu.Unlock()
-	if closed {
-		h.rejected.Add(1)
-		return fiber.ErrServiceUnavailable
-	}
-	var uid eventstream.UserID
-	err := safety.Call(func() error {
-		if h.userIDExtractor != nil {
-			var err error
-			uid, err = h.userIDExtractor(c)
-			return err
-		}
-		value := &Conn{locals: map[string]any{h.userIDCtxKey: c.Locals(h.userIDCtxKey)}}
-		var ok bool
-		uid, ok = h.getUserID(value)
-		if !ok {
-			return fiber.ErrUnauthorized
-		}
-		return nil
-	})
-	if err != nil || uid.IsZero() {
-		h.rejected.Add(1)
-		return fiber.ErrUnauthorized
-	}
-	ctx, cancel := context.WithCancel(eventstream.WithUserID(context.Background(), uid))
-	state := &connection{handler: h, ctx: ctx, cancel: cancel}
-	if !h.admit(state) {
-		cancel()
-		h.rejected.Add(1)
-		return fiber.ErrServiceUnavailable
-	}
-	// A failed HTTP response may never invoke the hijack callback. Bound that
-	// pending handoff as well; a late callback only closes its socket.
-	state.mu.Lock()
-	if state.finished || state.ctx.Err() != nil {
-		state.mu.Unlock()
-		state.finish()
-		return fiber.ErrServiceUnavailable
-	}
-	state.timer = time.AfterFunc(h.handoffTimeout, state.expirePending)
-	state.mu.Unlock()
-	handedOff := false
-	defer func() {
-		if !handedOff {
-			state.finish()
-		}
-	}()
-	err = safety.Call(func() error {
-		return h.upgrader.UpgradeFastHTTP(c.RequestCtx(), func(ws *libwebsocket.Conn) {
-			if !state.attach(ws) {
-				_ = ws.Close()
-				return
-			}
-			defer state.finish()
-			defer ws.Close()
-			h.accepted.Add(1)
-			err := safety.Call(func() error { return h.serveConnection(state.ctx, ws, uid) })
-			if err != nil && closeCode(err) == libwebsocket.CloseInternalServerErr {
-				h.logger.ErrorContext(state.ctx, "websocket connection failed", "panic", errors.Is(err, safety.ErrPanic))
-			}
-		})
-	})
-	if err != nil {
-		h.rejected.Add(1)
-		var handshake libwebsocket.HandshakeError
-		if errors.As(err, &handshake) {
-			return nil
-		} // The upgrader already wrote 400/403/405.
-		return fiber.NewError(fiber.StatusInternalServerError, "websocket upgrade failed")
-	}
-	handedOff = true
-	return nil
 }
 
 func (h *HTTPHandler) admit(state *connection) bool {

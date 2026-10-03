@@ -1,23 +1,32 @@
 # gowebsocket
 
-Bounded, process-local realtime event delivery for Go applications using Fiber v3
-and FastHTTP. Business code publishes an event to a user; all of that user's
+Bounded, process-local realtime event delivery for Go applications using `net/http`
+or Fiber v3/FastHTTP. Business code publishes an event to a user; all of that user's
 active subscriptions receive independently decoded copies.
 
 Requires **Go 1.27.0+**; the development toolchain remains **Go 1.27.1**.
 This is not a durable broker, an authentication system or a distributed socket
 cluster. There is no offline delivery, acknowledgement, replay or deduplication.
 
-## Run the complete example
+## Run a complete example
+
+Fiber v3:
 
 ```sh
 go run ./examples/basic
 # Open http://127.0.0.1:8080
 ```
 
-The example includes a browser client, JSON input/output, a validated event,
-a trusted identity extractor, an echo processor and shutdown. It binds only to
-loopback. Its demo session is **not production authentication**.
+Standard-library `net/http`:
+
+```sh
+go run ./examples/nethttp
+# Open http://127.0.0.1:8081
+```
+
+Both examples include a browser client, JSON input/output, a validated event,
+a trusted identity extractor, an echo processor and shutdown. They bind only to
+loopback. Their demo sessions are **not production authentication**.
 
 For a consumer module:
 
@@ -56,8 +65,9 @@ Use the same envelope codec on both ends; this format is not auto-detected.
 
 ## Authentication and application authorization
 
-Authenticate in your application, then use `WithUserIDExtractor` to return the
-verified `eventstream.UserID`. Authentication happens **before** HTTP 101.
+Authenticate in your application, then return the verified `eventstream.UserID`
+through `WithUserIDExtractor` for Fiber or `WithNetHTTPUserIDExtractor` for
+`net/http`. Authentication happens **before** HTTP 101.
 The processor retrieves the trusted value through:
 
 ```go
@@ -70,8 +80,46 @@ close or reauthorize its WebSocket session in the host application.
 
 The old `userIDCtxKey`/`GetUUID` path remains available for migration, including
 custom UUID return types. An invalid `GetUUID()` never falls back to a session's
-`String()` representation. No Fiber context, cookies or request metadata are
-retained after the identity is resolved.
+`String()` representation. This legacy path is Fiber-only. Neither adapter
+retains the request, cookies or request-context values after the identity is
+resolved. Only the immutable user ID is copied into the connection's context;
+disconnect and handler shutdown cancel that context.
+
+## Use with net/http
+
+`*handlers.HTTPHandler` implements `http.Handler`. Register it directly with a
+standard mux, using an explicit net/http identity extractor:
+
+```go
+h, err := handlers.NewHTTPHandler(handlers.NewOptions(
+	logger, bus, upgrader, nil, "",
+	handlers.WithNetHTTPUserIDExtractor(func(r *http.Request) (eventstream.UserID, error) {
+		// Your application verifies a session/token or reads trusted middleware state.
+		return authenticatedUserID(r)
+	}),
+	handlers.WithEventAdapters(adapters),
+	handlers.WithEventProcessors(processors),
+))
+if err != nil {
+	return err
+}
+mux := http.NewServeMux()
+mux.Handle("/ws", h)
+```
+
+`authenticatedUserID`, `logger`, `bus`, `upgrader`, `adapters` and `processors`
+above are application-owned. See [the runnable example](examples/nethttp/main.go)
+for complete wiring. `NetHTTPUserIDExtractor` has signature
+`func(*http.Request) (eventstream.UserID, error)`. A missing extractor, error,
+zero ID or extractor panic rejects the request with HTTP 401 before upgrade.
+There is no implicit request-context key lookup or fallback to Fiber identity.
+
+The existing constructors, `Serve(fiber.Ctx) error` and Fiber identity options
+remain available. Configure both extractors when serving both adapters through
+one handler. They share connection admission, limits, processors, `Stats()` and
+terminal `Shutdown(ctx)`; no separate WebSocket lifecycle is needed per router.
+`net/http` middleware wrapping the response writer must preserve the HTTP
+hijacking capability required by the upgrader.
 
 ## Resource limits and delivery guarantees
 
@@ -128,6 +176,12 @@ close the event stream and any **injected** processor you own. A closed shutdown
 channel is a compatibility trigger for handler shutdown, including before the
 first request. A nil channel means explicit shutdown only.
 
+For `net/http`, `http.Server.Shutdown` does **not** close or wait for hijacked
+WebSocket connections. Explicitly call `handler.Shutdown(ctx)` first, then close
+caller-owned stream/processors and call `server.Shutdown(ctx)`. Use a fresh,
+bounded context rather than the already-canceled signal context, and check all
+shutdown errors. An HTTP server stopping is not proof its WebSockets stopped.
+
 HTTPHandler owns its default processor and drains it automatically. It never
 closes an injected processor, stream or logger. `Service.Shutdown` cancels all
 subscriptions without requiring caller cancellation, clears registry entries
@@ -151,7 +205,20 @@ supports non-browser clients; Origin itself is not authentication.
 `NewUpgraderChecked` reports invalid configuration at startup. HTTP upgrade
 errors retain their original status instead of becoming 426.
 
-Configure HTTP read/write deadlines in the host Fiber/FastHTTP server as well:
+Configure HTTP deadlines in the host server as well. For `net/http`:
+
+```go
+server := &http.Server{
+	Addr:              "127.0.0.1:8081",
+	Handler:           mux,
+	ReadHeaderTimeout: 5 * time.Second,
+	ReadTimeout:       10 * time.Second,
+	WriteTimeout:      10 * time.Second,
+	IdleTimeout:       120 * time.Second,
+}
+```
+
+For Fiber/FastHTTP:
 
 ```go
 app := fiber.New(fiber.Config{

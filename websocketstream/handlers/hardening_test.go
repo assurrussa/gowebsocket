@@ -115,8 +115,10 @@ func newHardeningServerWithUpgrader(
 	log := slog.New(slog.DiscardHandler)
 	defaults := make([]handlers.OptOptionsSetter, 0, 2+len(options))
 	defaults = append(defaults,
-		handlers.WithEventAdapters(map[string]eventadapter.EventAdapter{"test": eventadapter.NewEventProcessor[*testevent.Event]()}),
-		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{"test": checkedProcessor{output: s.processed}}),
+		handlers.WithEventAdapters(map[string]eventadapter.EventAdapter{
+			testEventType: eventadapter.NewEventProcessor[*testevent.Event](),
+		}),
+		handlers.WithEventProcessors(map[string]eventprocessor.EventProcessor{testEventType: checkedProcessor{output: s.processed}}),
 	)
 	defaults = append(defaults, options...)
 	var err error
@@ -175,74 +177,86 @@ func (s *testServer) dial(t *testing.T) *libwebsocket.Conn {
 }
 
 func TestInboundJSONAndTrustedIdentity(t *testing.T) {
-	s := newHardeningServer(t)
-	conn := s.dial(t)
-	event := testevent.New("client message")
-	event.UserID = eventstream.NewUserID()
-	if err := conn.WriteJSON(event); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-s.processed:
-		if got.trusted != s.uid || got.claimed != event.UserID || got.body != event.Body {
-			t.Fatal("identity/message mismatch", got)
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t)
+		conn := s.dial(t)
+		event := testevent.New("client message")
+		event.UserID = eventstream.NewUserID()
+		if err := conn.WriteJSON(event); err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("incoming handler was not called")
-	}
+		select {
+		case got := <-s.processed:
+			if got.trusted != s.uid || got.claimed != event.UserID || got.body != event.Body {
+				t.Fatal("identity/message mismatch", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("incoming handler was not called")
+		}
+	})
 }
 
 func TestLegacyBase64StillWorks(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithWireFormat(handlers.LegacyBase64))
-	conn := s.dial(t)
-	encoded, err := json.Marshal(testevent.New("legacy"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	message := base64.StdEncoding.EncodeToString(encoded)
-	if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(message)); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-s.processed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("legacy format no longer works")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithWireFormat(handlers.LegacyBase64))
+		conn := s.dial(t)
+		encoded, err := json.Marshal(testevent.New("legacy"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := base64.StdEncoding.EncodeToString(encoded)
+		if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(message)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-s.processed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("legacy format no longer works")
+		}
+	})
 }
 
 func TestInvalidEventIsRejectedBeforeHandler(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON))
-	conn := s.dial(t)
-	if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(`{"eventType":"test"}`)); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := conn.ReadMessage()
-	if !libwebsocket.IsCloseError(err, libwebsocket.ClosePolicyViolation) {
-		t.Fatalf("expected policy close: %v", err)
-	}
-	select {
-	case <-s.processed:
-		t.Fatal("invalid event reached handler")
-	default:
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithWireFormat(handlers.JSON))
+		conn := s.dial(t)
+		if err := conn.WriteMessage(libwebsocket.TextMessage, []byte(`{"eventType":testEventType}`)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := conn.ReadMessage()
+		if !libwebsocket.IsCloseError(err, libwebsocket.ClosePolicyViolation) {
+			t.Fatalf("expected policy close: %v", err)
+		}
+		select {
+		case <-s.processed:
+			t.Fatal("invalid event reached handler")
+		default:
+		}
+	})
 }
 
 func TestCompressedMessageLimit(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON), handlers.WithMessageLimits(2048, 1024))
-	conn := s.dial(t)
-	conn.EnableWriteCompression(true)
-	if err := conn.WriteJSON(testevent.New(strings.Repeat("x", 10000))); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := conn.ReadMessage()
-	if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) {
-		t.Fatalf("expected oversized close: %v", err)
-	}
-	select {
-	case <-s.processed:
-		t.Fatal("oversized event reached handler")
-	default:
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithWireFormat(handlers.JSON), handlers.WithMessageLimits(2048, 1024))
+		conn := s.dial(t)
+		conn.EnableWriteCompression(true)
+		if err := conn.WriteJSON(testevent.New(strings.Repeat("x", 10000))); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := conn.ReadMessage()
+		if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) {
+			t.Fatalf("expected oversized close: %v", err)
+		}
+		select {
+		case <-s.processed:
+			t.Fatal("oversized event reached handler")
+		default:
+		}
+	})
 }
 
 // Embedding the legacy interface hides optional transport limit information.
@@ -332,39 +346,47 @@ func TestTransportReadLimitCountsCompressedPayload(t *testing.T) {
 }
 
 func TestIdentityRejectedBeforeUpgrade(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithUserIDExtractor(func(fiber.Ctx) (eventstream.UserID, error) {
-		return eventstream.UserIDNil, errors.New("invalid session")
-	}))
-	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
-	if conn != nil {
-		_ = conn.Close()
-	}
-	if response != nil && response.Body != nil {
-		defer response.Body.Close()
-	}
-	if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected HTTP 401 before 101: %v %v", response, err)
-	}
-	if s.bus.Stats().Subscribers != 0 {
-		t.Fatal("unauthorized subscription")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithUserIDExtractor(func(fiber.Ctx) (eventstream.UserID, error) {
+			return eventstream.UserIDNil, errors.New("invalid session")
+		}), handlers.WithNetHTTPUserIDExtractor(func(*http.Request) (eventstream.UserID, error) {
+			return eventstream.UserIDNil, errors.New("invalid session")
+		}))
+		conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if response != nil && response.Body != nil {
+			defer response.Body.Close()
+		}
+		if err == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected HTTP 401 before 101: %v %v", response, err)
+		}
+		if s.bus.Stats().Subscribers != 0 {
+			t.Fatal("unauthorized subscription")
+		}
+	})
 }
 
 func TestOriginStatusPreserved(t *testing.T) {
-	s := newHardeningServer(t)
-	conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{"https://not-allowed.example"}})
-	if conn != nil {
-		_ = conn.Close()
-	}
-	if response != nil && response.Body != nil {
-		defer response.Body.Close()
-	}
-	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected original HTTP 403: %v %v", response, err)
-	}
-	if s.h.Stats().Active != 0 {
-		t.Fatal("failed upgrade leaked admission")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t)
+		conn, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{"https://not-allowed.example"}})
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if response != nil && response.Body != nil {
+			defer response.Body.Close()
+		}
+		if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected original HTTP 403: %v %v", response, err)
+		}
+		if s.h.Stats().Active != 0 {
+			t.Fatal("failed upgrade leaked admission")
+		}
+	})
 }
 
 type failingWriter struct{}
@@ -372,55 +394,61 @@ type failingWriter struct{}
 func (failingWriter) Write(any, io.Writer) error { return errors.New("intentional writer failure") }
 
 func TestWriterFailureUnblocksReader(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithEventWriter(failingWriter{}))
-	conn := s.dial(t)
-	select {
-	case <-s.bus.ready:
-	case <-time.After(time.Second):
-		t.Fatal("no subscription")
-	}
-	if err := s.bus.Publish(context.Background(), s.uid, testevent.New("outgoing")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := conn.ReadMessage(); err == nil {
-		t.Fatal("writer failure did not close connection")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := s.h.Shutdown(ctx); err != nil {
-		t.Fatalf("blocked reader survived writer error: %v", err)
-	}
-	if s.h.Stats().Active != 0 {
-		t.Fatal("active connection retained")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithEventWriter(failingWriter{}))
+		conn := s.dial(t)
+		select {
+		case <-s.bus.ready:
+		case <-time.After(time.Second):
+			t.Fatal("no subscription")
+		}
+		if err := s.bus.Publish(context.Background(), s.uid, testevent.New("outgoing")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := conn.ReadMessage(); err == nil {
+			t.Fatal("writer failure did not close connection")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.h.Shutdown(ctx); err != nil {
+			t.Fatalf("blocked reader survived writer error: %v", err)
+		}
+		if s.h.Stats().Active != 0 {
+			t.Fatal("active connection retained")
+		}
+	})
 }
 
 func TestNormalCloseAndConnectionLimit(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithMaxConnections(1))
-	conn := s.dial(t)
-	extra, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
-	if extra != nil {
-		_ = extra.Close()
-	}
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("connection limit not enforced: %v %v", response, err)
-	}
-	closePayload := libwebsocket.FormatCloseMessage(libwebsocket.CloseNormalClosure, "")
-	if err := conn.WriteControl(libwebsocket.CloseMessage, closePayload, time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = conn.ReadMessage()
-	if !libwebsocket.IsCloseError(err, libwebsocket.CloseNormalClosure) {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := s.h.Shutdown(ctx); err != nil {
-		t.Fatal(err)
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithMaxConnections(1))
+		conn := s.dial(t)
+		extra, response, err := s.dialer.Dial("ws://localhost/ws", http.Header{originHeader: []string{testOrigin}})
+		if extra != nil {
+			_ = extra.Close()
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if err == nil || response == nil || response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("connection limit not enforced: %v %v", response, err)
+		}
+		closePayload := libwebsocket.FormatCloseMessage(libwebsocket.CloseNormalClosure, "")
+		if err := conn.WriteControl(libwebsocket.CloseMessage, closePayload, time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = conn.ReadMessage()
+		if !libwebsocket.IsCloseError(err, libwebsocket.CloseNormalClosure) {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.h.Shutdown(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestZeroPingRejected(t *testing.T) {
@@ -474,36 +502,39 @@ func TestClosedShutdownChannelRejectsFirstRequest(t *testing.T) {
 }
 
 func TestMalformedAndUnsupportedMessages(t *testing.T) {
-	cases := []struct {
-		name    string
-		kind    int
-		payload []byte
-		code    int
-	}{
-		{name: "binary", kind: libwebsocket.BinaryMessage, payload: []byte(`{}`), code: libwebsocket.CloseUnsupportedData},
-		{name: "JSON", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":`), code: libwebsocket.ClosePolicyViolation},
-		{name: "UTF8", kind: libwebsocket.TextMessage, payload: []byte{255}, code: libwebsocket.ClosePolicyViolation},
-		{
-			name: "unknown", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":"unknown"}`),
-			code: libwebsocket.ClosePolicyViolation,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON))
-			conn := s.dial(t)
-			if err := conn.WriteMessage(tc.kind, tc.payload); err != nil {
-				t.Fatal(err)
-			}
-			_, _, err := conn.ReadMessage()
-			if !libwebsocket.IsCloseError(err, tc.code) {
-				t.Fatalf("unexpected close code: %v", err)
-			}
-			if s.h.Stats().Incoming != 0 {
-				t.Fatal("rejected message was admitted")
-			}
-		})
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		cases := []struct {
+			name    string
+			kind    int
+			payload []byte
+			code    int
+		}{
+			{name: "binary", kind: libwebsocket.BinaryMessage, payload: []byte(`{}`), code: libwebsocket.CloseUnsupportedData},
+			{name: "JSON", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":`), code: libwebsocket.ClosePolicyViolation},
+			{name: "UTF8", kind: libwebsocket.TextMessage, payload: []byte{255}, code: libwebsocket.ClosePolicyViolation},
+			{
+				name: "unknown", kind: libwebsocket.TextMessage, payload: []byte(`{"eventType":"unknown"}`),
+				code: libwebsocket.ClosePolicyViolation,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newServer(t, handlers.WithWireFormat(handlers.JSON))
+				conn := s.dial(t)
+				if err := conn.WriteMessage(tc.kind, tc.payload); err != nil {
+					t.Fatal(err)
+				}
+				_, _, err := conn.ReadMessage()
+				if !libwebsocket.IsCloseError(err, tc.code) {
+					t.Fatalf("unexpected close code: %v", err)
+				}
+				if s.h.Stats().Incoming != 0 {
+					t.Fatal("rejected message was admitted")
+				}
+			})
+		}
+	})
 }
 
 type overloadedProcessor struct{}
@@ -515,18 +546,21 @@ func (overloadedProcessor) Submit(context.Context, eventstream.Event) error {
 }
 
 func TestProcessorOverloadClosesWithRetryCode(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON), handlers.WithReadEventProcessor(overloadedProcessor{}))
-	conn := s.dial(t)
-	if err := conn.WriteJSON(testevent.New("overload")); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := conn.ReadMessage()
-	if !libwebsocket.IsCloseError(err, libwebsocket.CloseTryAgainLater) {
-		t.Fatalf("overload did not close with 1013: %v", err)
-	}
-	if s.h.Stats().Incoming != 0 {
-		t.Fatal("overloaded message was admitted")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithWireFormat(handlers.JSON), handlers.WithReadEventProcessor(overloadedProcessor{}))
+		conn := s.dial(t)
+		if err := conn.WriteJSON(testevent.New("overload")); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := conn.ReadMessage()
+		if !libwebsocket.IsCloseError(err, libwebsocket.CloseTryAgainLater) {
+			t.Fatalf("overload did not close with 1013: %v", err)
+		}
+		if s.h.Stats().Incoming != 0 {
+			t.Fatal("overloaded message was admitted")
+		}
+	})
 }
 
 type failingSubmitter struct{ err error }
@@ -536,101 +570,110 @@ func (failingSubmitter) Process(context.Context, eventstream.Event) { panic("Sub
 func (p failingSubmitter) Submit(context.Context, eventstream.Event) error { return p.err }
 
 func TestProcessorCancellationIsNotPolicyViolation(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		code int
-	}{
-		{name: "canceled", err: context.Canceled, code: libwebsocket.CloseNormalClosure},
-		{name: "wrapped canceled", err: fmt.Errorf("submit: %w", context.Canceled), code: libwebsocket.CloseNormalClosure},
-		{name: "deadline", err: context.DeadlineExceeded, code: libwebsocket.CloseInternalServerErr},
-		{
-			name: "wrapped deadline", err: fmt.Errorf("submit: %w", context.DeadlineExceeded),
-			code: libwebsocket.CloseInternalServerErr,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newHardeningServer(t, handlers.WithWireFormat(handlers.JSON),
-				handlers.WithReadEventProcessor(failingSubmitter{err: tc.err}))
-			conn := s.dial(t)
-			// Keep the connection context live so the pump result determines the close.
-			if err := conn.WriteJSON(testevent.New("submission canceled")); err != nil {
-				t.Fatal(err)
-			}
-			_, _, err := conn.ReadMessage()
-			if !libwebsocket.IsCloseError(err, tc.code) {
-				t.Fatalf("submission cancellation closed with the wrong code: %v", err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if err := s.h.Shutdown(ctx); err != nil {
-				t.Fatal(err)
-			}
-			stats := s.h.Stats()
-			if stats.PolicyClosed != 0 || stats.Incoming != 0 {
-				t.Fatal("canceled submission counted as a policy violation or accepted message", stats)
-			}
-			if tc.code == libwebsocket.CloseNormalClosure && stats.NormalClosed != 1 {
-				t.Fatal("cancellation was not counted as a normal close", stats)
-			}
-			if tc.code == libwebsocket.CloseInternalServerErr && stats.InternalClosed != 1 {
-				t.Fatal("deadline was not counted as an internal close", stats)
-			}
-		})
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		cases := []struct {
+			name string
+			err  error
+			code int
+		}{
+			{name: "canceled", err: context.Canceled, code: libwebsocket.CloseNormalClosure},
+			{name: "wrapped canceled", err: fmt.Errorf("submit: %w", context.Canceled), code: libwebsocket.CloseNormalClosure},
+			{name: "deadline", err: context.DeadlineExceeded, code: libwebsocket.CloseInternalServerErr},
+			{
+				name: "wrapped deadline", err: fmt.Errorf("submit: %w", context.DeadlineExceeded),
+				code: libwebsocket.CloseInternalServerErr,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newServer(t, handlers.WithWireFormat(handlers.JSON),
+					handlers.WithReadEventProcessor(failingSubmitter{err: tc.err}))
+				conn := s.dial(t)
+				// Keep the connection context live so the pump result determines the close.
+				if err := conn.WriteJSON(testevent.New("submission canceled")); err != nil {
+					t.Fatal(err)
+				}
+				_, _, err := conn.ReadMessage()
+				if !libwebsocket.IsCloseError(err, tc.code) {
+					t.Fatalf("submission cancellation closed with the wrong code: %v", err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				if err := s.h.Shutdown(ctx); err != nil {
+					t.Fatal(err)
+				}
+				stats := s.h.Stats()
+				if stats.PolicyClosed != 0 || stats.Incoming != 0 {
+					t.Fatal("canceled submission counted as a policy violation or accepted message", stats)
+				}
+				if tc.code == libwebsocket.CloseNormalClosure && stats.NormalClosed != 1 {
+					t.Fatal("cancellation was not counted as a normal close", stats)
+				}
+				if tc.code == libwebsocket.CloseInternalServerErr && stats.InternalClosed != 1 {
+					t.Fatal("deadline was not counted as an internal close", stats)
+				}
+			})
+		}
+	})
 }
 
 func TestOutboundLimitRejectsWithoutDeliveringPayload(t *testing.T) {
-	s := newHardeningServer(t, handlers.WithMaxOutboundBytes(64))
-	conn := s.dial(t)
-	select {
-	case <-s.bus.ready:
-	case <-time.After(time.Second):
-		t.Fatal("no subscription")
-	}
-	if err := s.bus.Publish(context.Background(), s.uid, testevent.New("outgoing")); err != nil {
-		t.Fatal(err)
-	}
-	_, data, err := conn.ReadMessage()
-	if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) || len(data) != 0 {
-		t.Fatalf("oversized output was delivered: %q %v", data, err)
-	}
-	if s.h.Stats().Outgoing != 0 {
-		t.Fatal("oversized output counted as delivered")
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		s := newServer(t, handlers.WithMaxOutboundBytes(64))
+		conn := s.dial(t)
+		select {
+		case <-s.bus.ready:
+		case <-time.After(time.Second):
+			t.Fatal("no subscription")
+		}
+		if err := s.bus.Publish(context.Background(), s.uid, testevent.New("outgoing")); err != nil {
+			t.Fatal(err)
+		}
+		_, data, err := conn.ReadMessage()
+		if !libwebsocket.IsCloseError(err, libwebsocket.CloseMessageTooBig) || len(data) != 0 {
+			t.Fatalf("oversized output was delivered: %q %v", data, err)
+		}
+		if s.h.Stats().Outgoing != 0 {
+			t.Fatal("oversized output counted as delivered")
+		}
+	})
 }
 
 func TestSubscriptionFailureSendsInternalClose(t *testing.T) {
-	cases := []struct {
-		name      string
-		subscribe func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error)
-	}{
-		{name: "nil channel", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
-			//nolint:nilnil // Simulate a stream violating the Subscribe contract.
-			return nil, nil
-		}},
-		{name: "panic", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
-			panic("subscription failed")
-		}},
-		{name: "error", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
-			return nil, errors.New("subscription error")
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newHardeningServer(t)
-			s.bus.subscribe = tc.subscribe
-			conn := s.dial(t)
-			_, _, err := conn.ReadMessage()
-			if !libwebsocket.IsCloseError(err, libwebsocket.CloseInternalServerErr) {
-				t.Fatalf("subscription failure did not close with 1011: %v", err)
-			}
-			if s.h.Stats().InternalClosed != 1 {
-				t.Fatal("subscription close was not counted")
-			}
-		})
-	}
+	forTransports(t, func(t *testing.T, newServer serverFactory) {
+		t.Helper()
+		cases := []struct {
+			name      string
+			subscribe func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error)
+		}{
+			{name: "nil channel", subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+				//nolint:nilnil // Simulate a stream violating the Subscribe contract.
+				return nil, nil
+			}},
+			{name: failurePanic, subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+				panic("subscription failed")
+			}},
+			{name: failureError, subscribe: func(context.Context, eventstream.UserID) (<-chan eventstream.Event, error) {
+				return nil, errors.New("subscription error")
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newServer(t)
+				s.bus.subscribe = tc.subscribe
+				conn := s.dial(t)
+				_, _, err := conn.ReadMessage()
+				if !libwebsocket.IsCloseError(err, libwebsocket.CloseInternalServerErr) {
+					t.Fatalf("subscription failure did not close with 1011: %v", err)
+				}
+				if s.h.Stats().InternalClosed != 1 {
+					t.Fatal("subscription close was not counted")
+				}
+			})
+		}
+	})
 }
 
 type pendingUpgrader struct{ websocketstream.Upgrader }
