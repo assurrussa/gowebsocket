@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Removed the test-only `github.com/assurrussa/gologger` dependency by using the
+standard-library slog discard handler in historical handler tests. The public
+logger interface and runtime logging behavior are unchanged.
+
 Added `HTTPHandler.ServeHTTP` for standard-library `net/http` routers and
 `WithNetHTTPUserIDExtractor` for explicit, verified identity before upgrade.
 The Fiber API remains compatible. Both adapters share bounded connection

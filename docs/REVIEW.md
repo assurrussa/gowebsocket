@@ -73,8 +73,9 @@ clean consumer smoke test. Repository
 visibility, release tags and protections are unchanged.
 
 R27: standard JSON in production, a small slog-compatible logger interface and
-handwritten options. gologger/go-json remain test dependencies where historical
-tests use them. Broker, durability, rooms and presence are deliberately not added.
+handwritten options. Historical handler tests now use the standard-library slog
+discard handler, removing the gologger module dependency; go-json remains a test
+dependency. Broker, durability, rooms and presence are deliberately not added.
 
 ## Verification limitations
 
