@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"testing"
 	"time"
 
-	logger "github.com/assurrussa/gologger"
 	libwebsocket "github.com/fasthttp/websocket"
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -47,7 +47,7 @@ func TestHTTPHandler(t *testing.T) {
 	eventsCh := make(chan eventstream.Event)
 	shutdownCh := make(chan struct{})
 
-	log := logger.Default().WithNamed("TestHTTPHandler")
+	log := slog.New(slog.DiscardHandler)
 
 	h, err := handlers2.NewHTTPHandler(handlers2.NewOptions(
 		log,
@@ -190,7 +190,7 @@ func TestWebSocketUpgrade(t *testing.T) {
 	eventsCh := make(chan eventstream.Event, 1)
 	shutdownCh := make(chan struct{})
 
-	log := logger.Default().WithNamed("TestWebSocketUpgrade")
+	log := slog.New(slog.DiscardHandler)
 
 	h, err := handlers2.NewHTTPHandler(handlers2.NewOptions(
 		log,
@@ -288,7 +288,7 @@ func (s customSessionWithEventstreamUserID) GetUUID() eventstream.UserID {
 }
 
 func TestGetUserIDVariations(t *testing.T) {
-	log := logger.Default().WithNamed("TestGetUserIDVariations")
+	log := slog.New(slog.DiscardHandler)
 	uid := eventstream.NewUserID()
 	rawUUID := uuid.UUID(uid)
 	rawStr := uid.String()
